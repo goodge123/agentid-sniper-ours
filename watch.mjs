@@ -547,58 +547,98 @@ const KNOWN_SEL = new Set(['1249c58b', '5b70ea9f', '4e71d92d', 'a0712d68', '2609
 const MECH_FAMS = [['质押', /stake|staking/i], ['销毁', /\bburn\b|burnable/i], ['联合曲线', /bonding|\bcurve\b/i], ['纪元/赛季', /epoch|season/i], ['任务', /quest/i], ['投票治理', /voting|\bvote\b|governor/i], ['复投/收割', /compound|harvest/i], ['借贷', /lending|\bborrow\b/i]];
 const mechFams = (src) => MECH_FAMS.filter(([, re]) => re.test(src)).map(([name]) => name);
 const innoCache = new Map();
-const innoTrig = (r) => !!r && r.hard >= 1 && r.score >= 3; // 触发门槛：≥1 项实质证据（机制词/多交互/双资产）且总分 ≥3，结构类只作辅助
+const gradeOf = (t) => (t >= 65 ? 'A' : t >= 40 ? 'B' : 'C'); // 总分 90：A ≥65、B ≥40
+const innoTrig = (r) => !!r && r.grade === 'A';
 const learnedSelN = (c) => new Set((S.learned?.[c] || []).map((d) => d.slice(0, 10).toLowerCase())).size;
+const jaccard = (a, b) => { const A = new Set(a), B = new Set(b); let inter = 0; for (const x of A) if (B.has(x)) inter++; const uni = A.size + B.size - inter; return uni ? inter / uni : 0; };
+function compareHist(sels, fams, hist, selfAddr, srcHash) {
+  // 与历史指纹库对比：最像的项目 + 历史首现的函数/机制
+  let sim = 0, near = null, base = 0;
+  const seenS = new Set(), seenF = new Set();
+  for (const [addr, h] of Object.entries(hist || {})) {
+    if (addr === selfAddr || !h.sels) continue;
+    base++;
+    for (const s of h.sels) seenS.add(s);
+    for (const f of h.fams || []) seenF.add(f);
+    const j = srcHash && h.srcHash === srcHash ? 1 : jaccard(sels, h.sels);
+    if (j > sim) { sim = j; near = { addr, name: h.name || '', sim: j }; }
+  }
+  return { sim, near, base, firstSels: sels.filter((s) => !KNOWN_SEL.has(s) && !seenS.has(s)), firstFams: fams.filter((f) => !seenF.has(f)) };
+}
 async function innovation(c, P) {
   const ent = innoCache.get(c);
   if (ent && now() - ent.at < 1800e3 && ent.res.learnedN === learnedSelN(c)) return ent.res;
-  let score = 0, hard = 0;
-  const hits = [];
+  const learnedN = learnedSelN(c);
+  let sels = new Set(), fams = [], srcHash = '', regFns = 0, srcLen = 0;
   try {
     const src = await sourcifySrc(await logicAddr(c));
     if (src) {
-      if (src.length > 15000) { score++; hits.push('源码已验证且规模大（非模板小合约）'); }
-      const sels = new Set();
+      srcLen = src.length;
+      srcHash = keccak256(Buffer.from(src, 'utf8')).slice(0, 16);
       for (const m of src.matchAll(/function\s+(\w+)\s*\(([^)]*)\)/g)) {
         const types = m[2].split(',').map((p) => p.trim().split(/\s+/)[0]).filter(Boolean).join(',');
         if (types.includes('(')) continue;
         try { sels.add(sigSel(`${m[1]}(${types})`)); } catch {}
       }
-      const novel = [...sels].filter((s) => !KNOWN_SEL.has(s));
-      if (novel.length >= 3) { score++; hits.push(`有 ${novel.length} 个非常规函数（自有机制）`); }
-      const fams = mechFams(src);
-      if (fams.length >= 2) { score++; hard++; hits.push('含专有机制：' + fams.join('/')); }
+      fams = mechFams(src);
+      const regLit = '60b9262456de011f7d15a54cdd8c48baaa8b022f';
+      const segs = src.split(/function\s+/);
+      for (let i = 1; i < segs.length; i++) if (segs[i].toLowerCase().includes(regLit)) regFns++;
+      // 历史指纹库（落盘）：函数集合 + 机制族 + 源码哈希
+      S.hist = S.hist || {};
+      S.hist[c] = { name: P?.name || S.hist[c]?.name || '', at: S.hist[c]?.at || now(), sels: [...sels].slice(0, 200), fams, srcHash };
+      save();
     }
-    if (P?.dualAsset) { score++; hard++; hits.push('铸造同时产出代币与 NFT'); }
-    try {
-      const tk = await tokenOf(c).catch(() => c);
-      const impl = await logicAddr(c).catch(() => c);
-      const pieces = 1 + (LC(tk) !== LC(c) ? 1 : 0) + (impl && impl !== LC(c) ? 1 : 0);
-      if (pieces >= 3) { score++; hits.push('成套架构（代理+独立代币+铸造合约）'); }
-    } catch {}
-    if (learnedSelN(c) >= 2) { score++; hard++; hits.push('Agent ID 钱包有多种交互方式（不止铸造）'); }
-    if (await hasRefund(c)) { score++; hits.push('带退款保本机制'); }
   } catch {}
-  const res = { score, hard, hits, learnedN: learnedSelN(c) };
+  const cmp = compareHist([...sels], fams, S.hist, c, srcHash);
+  // 四维评分（满分 90；叙事维无数据源，不计）
+  let origPts = srcLen ? Math.round(30 * (1 - cmp.sim)) : 5; // 原创性 /30
+  if (cmp.base < 5) origPts = Math.min(origPts, 15); // 历史样本不足时不给满
+  let mechPts = Math.min(15, cmp.firstSels.length * 3) + Math.min(10, cmp.firstFams.length * 5); // 机制新颖 /25
+  if (cmp.base < 5) mechPts = Math.min(mechPts, 8);
+  mechPts = Math.min(25, mechPts);
+  const regPart = regFns >= 3 ? 12 : regFns === 2 ? 8 : regFns === 1 ? 4 : 0;
+  const extraIx = Math.max(0, learnedN - 1);
+  const identPts = Math.min(20, regPart + (extraIx >= 2 ? 8 : extraIx === 1 ? 4 : 0)); // 身份应用 /20
+  const proofBase = learnedN >= 4 ? 15 : learnedN === 3 ? 11 : learnedN === 2 ? 7 : learnedN === 1 ? 3 : 0;
+  const proofPts = Math.max(proofBase, P?.dualAsset ? 7 : 0); // 链上实证 /15
+  const total = origPts + mechPts + identPts + proofPts;
+  const grade = gradeOf(total);
+  const hits = [];
+  hits.push(cmp.near ? `原创性 ${origPts}/30：与历史项目「${cmp.near.name || cmp.near.addr.slice(0, 10)}」最像，函数相似度 ${Math.round(cmp.sim * 100)}%` : `原创性 ${origPts}/30：历史库可比项目 ${cmp.base} 个`);
+  if (cmp.firstFams.length) hits.push('首现机制：' + cmp.firstFams.join('/'));
+  if (cmp.firstSels.length) hits.push(`${cmp.firstSels.length} 个历史未见过的函数`);
+  if (fams.length >= 2) hits.push('含机制：' + fams.join('/'));
+  hits.push(`身份应用 ${identPts}/20：登记合约被 ${regFns} 个函数引用，链上 ${learnedN} 种交互`);
+  hits.push(`链上实证 ${proofPts}/15`);
+  if (P?.dualAsset) hits.push('铸造同时产出代币与 NFT');
+  const res = { score: total, score100: total, grade, hard: (fams.length >= 2 ? 1 : 0) + (learnedN >= 2 ? 1 : 0) + (P?.dualAsset ? 1 : 0), hits, learnedN, clue: cmp.base >= 3 && (cmp.firstFams.length >= 1 || cmp.firstSels.length >= 3), parts: { origPts, mechPts, identPts, proofPts } };
   innoCache.set(c, { res, at: now() });
   if (P) {
-    if (innoTrig(res)) { if (P.innovative !== res.score) { P.innovative = res.score; save(); } }
+    if (grade !== 'C') { if (P.innovative !== total) { P.innovative = total; save(); } }
     else if (P.innovative) { delete P.innovative; save(); }
   }
   return res;
 }
 async function innoAlert(c, P, extra = '') {
-  const inno = await innovation(c, P).catch(() => ({ score: 0, hard: 0, hits: [] }));
-  if (P.innoScore !== inno.score || P.innoHard !== inno.hard) { P.innoScore = inno.score; P.innoHard = inno.hard; save(); }
-  if (!innoTrig(inno)) return inno;
-  let kind = '';
-  if (!P.innoStage) kind = '首次发现';
-  else if (P.innoStage === 1 && (inno.hard > (P.innoAlertHard || 0) || inno.score >= (P.innoAlertScore || 0) + 2)) kind = '新证据进展';
+  const inno = await innovation(c, P).catch(() => null);
+  if (!inno) return { score: 0, score100: 0, grade: 'C', hard: 0, hits: [] };
+  // 成长记录：分数变化 ≥5 或等级变化留一条（最多 10 条）
+  const lastH = (P.innoHist || []).slice(-1)[0];
+  if (!lastH || Math.abs(inno.score100 - lastH.score) >= 5 || lastH.grade !== inno.grade) P.innoHist = [...(P.innoHist || []), { at: now(), score: inno.score100, grade: inno.grade }].slice(-10);
+  if (P.inno100 !== inno.score100 || P.innoGrade !== inno.grade) { P.inno100 = inno.score100; P.innoGrade = inno.grade; save(); }
+  // 分级提醒：A 重点 / B 观察 / C 有首现证据时发早期线索；已报 A 后分数再涨 10 发进展
+  let kind = '', stageTo = 0;
+  if (inno.grade === 'A' && (P.innoStage || 0) < 2) { kind = 'A级·重点提醒'; stageTo = 2; }
+  else if (inno.grade === 'B' && (P.innoStage || 0) < 1) { kind = 'B级·创新观察'; stageTo = 1; }
+  else if (inno.grade === 'C' && inno.clue && (P.innoStage || 0) < 1) { kind = '早期创新线索'; stageTo = 1; }
+  else if ((P.innoStage || 0) >= 2 && (P.innoStage || 0) < 3 && inno.score100 >= (P.innoAlertScore || 0) + 10) { kind = '创新进展'; stageTo = 3; }
   if (!kind) return inno;
   if ((P.innoTries || 0) >= 5 || now() < (P.innoTryAt || 0)) return inno;
-  const delivered = await tg(`⭐ 重点提醒·创新候选（${kind}）：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\n证据：实质 ${inno.hard} 项，总分 ${inno.score}${extra}\nTG 发「创新」可看全部圈出的创新项目`);
+  const star = kind.startsWith('A级') || kind === '创新进展' ? '⭐' : '🔍';
+  const delivered = await tg(`${star} ${kind}：${P.name || ''}（创新评分 ${inno.score100}/90，${inno.grade} 级）\n${c}\n${inno.hits.join('\n')}${extra}\nTG 发「创新」可看全部圈出项目`);
   P.innoTries = (P.innoTries || 0) + 1;
-  if (delivered) { P.innoStage = kind === '首次发现' ? 1 : 2; P.innoAlertScore = inno.score; P.innoAlertHard = inno.hard; P.innoTries = 0; P.innoTryAt = 0; }
+  if (delivered) { P.innoStage = stageTo; P.innoAlertScore = inno.score100; P.innoTries = 0; P.innoTryAt = 0; }
   else P.innoTryAt = now() + 1800e3; // 未送达：30 分钟后补发，最多 5 次
   save();
   return inno;
@@ -717,7 +757,8 @@ async function autoMint(c, found, W) {
   }
   if (serialN >= 3) note += `\n（部署者已发 ${serialN} 个项目）`;
   const inno = await innoAlert(c, P);
-  if (innoTrig(inno)) note += '\n（⭐ 创新候选：' + inno.hits.join('、') + '）';
+  if (inno.grade === 'A') note += `\n（⭐ 创新候选 ${inno.score100}/90）`;
+  else if (inno.grade === 'B') note += `\n（🔍 创新观察 ${inno.score100}/90）`;
   // 每日上限与 gas 余额
   const tk2 = todayKey();
   S.mintCnt = S.mintCnt || {};
@@ -820,12 +861,12 @@ async function analyzePaid(c, P) {
 类型：${{ bnb: 'BNB 报价型', usdt: 'USDT 份额型', gen: 'NFT 单价型' }[kind] || kind}
 单价：${unitTxt}${costTxt ? `\n成本：${costTxt}` : ''}
 参与：Agent ID 钱包约 ${agents} 个${eff !== agents ? `（同块批量打折后有效约 ${eff} 个）` : ''}${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
-创新：${innoTrig(inno) ? '⭐ 有创新点' : '一般'}（实质 ${inno.hard || 0} 项，总分 ${inno.score}）${inno.hits.length ? '（' + inno.hits.join('、') + '）' : ''}
+创新：${inno.grade} 级 ${inno.score100}/90${inno.hits.length ? '（' + inno.hits.slice(0, 3).join('；') + '）' : ''}
 保本：合约有退款函数 ✓${pool ? '\n状态：已开池' : ''}${rn}
 合约审核：${au.verdict === 'clean' ? '源码已验证、未见红旗' : au.verdict === 'flag' ? '源码已验证但有红旗：' + au.hard.join('、') : au.verdict === 'soft' ? '源码已验证，审核提示：' + au.soft.join('、') : '源码未验证'}
 结论：${verdict}——${reason}
 要打回主聊天告诉我打哪个、多少份，我先预览报总成本和每份到账，你确认了才执行；不回就不打`);
-  if (innoTrig(inno)) await innoAlert(c, P, `\n付费结论：${verdict}——${reason}`);
+  await innoAlert(c, P, `\n付费结论：${verdict}——${reason}`);
 }
 async function paidSweep() {
   for (const [c, P] of Object.entries(S.track)) {
@@ -987,7 +1028,7 @@ async function handleTgCmd(text) {
   if (text === '创新') {
     const list = Object.entries(S.track).filter(([, P]) => P.innovative && now() - (P.at || 0) < 7 * 86400e3);
     if (!list.length) { await tg('近 7 天还没有圈出的创新项目'); return; }
-    const lines = list.map(([c, P]) => `⭐ ${P.name || c.slice(0, 10)}｜裁决：${P.verdict?.s || '未定'}${P.verdict?.why ? '（' + P.verdict.why + '）' : ''}\n${c}`);
+    const lines = list.map(([c, P]) => `⭐ ${P.name || c.slice(0, 10)}｜${P.innoGrade || ''} 级 ${P.innovative}/90｜裁决：${P.verdict?.s || '未定'}${P.verdict?.why ? '（' + P.verdict.why + '）' : ''}\n${c}`);
     await tg('圈出的创新项目：\n' + lines.join('\n'));
     return;
   }
@@ -1137,10 +1178,21 @@ function runSelfTest() {
   ok(KNOWN_SEL.has(sigSel('mint()')), 'mint() is a known selector');
   eq(mechFams('function stake(uint n) public {} function burn(uint n) public {}').length, 2, 'mechFams two families');
   eq(mechFams('function mint() public {}').length, 0, 'mechFams plain template none');
-  eq(innoTrig({ hard: 0, score: 5 }), false, 'innoTrig no-hard blocked');
-  eq(innoTrig({ hard: 1, score: 2 }), false, 'innoTrig low-score blocked');
-  eq(innoTrig({ hard: 1, score: 3 }), true, 'innoTrig hard+3 passes');
-  eq(innoTrig({ hard: 2, score: 3 }), true, 'innoTrig 2hard+3 passes');
+  eq(innoTrig({ grade: 'A' }), true, 'innoTrig grade A');
+  eq(innoTrig({ grade: 'B' }), false, 'innoTrig grade B blocked');
+  eq(gradeOf(65), 'A', 'gradeOf 65 = A');
+  eq(gradeOf(64), 'B', 'gradeOf 64 = B');
+  eq(gradeOf(40), 'B', 'gradeOf 40 = B');
+  eq(gradeOf(39), 'C', 'gradeOf 39 = C');
+  eq(Math.round(jaccard(['a', 'b'], ['b', 'c']) * 100), 33, 'jaccard 1/3');
+  const histT = { '0xaaa': { name: 'Old', sels: ['aaaaaaaa', 'bbbbbbbb'], fams: ['质押'], srcHash: 'hx' } };
+  const rc = compareHist(['aaaaaaaa', 'bbbbbbbb'], ['质押'], histT, '0xbbb', 'different');
+  eq(Math.round(rc.sim * 100), 100, 'compareHist clone sim 100');
+  eq(rc.firstSels.length, 0, 'compareHist clone no first-seen');
+  const rn = compareHist(['cccccccc'], ['任务'], histT, '0xbbb', 'hz');
+  eq(rn.firstSels.length, 1, 'compareHist new first-seen sel');
+  eq(rn.firstFams[0], '任务', 'compareHist new first-seen fam');
+  eq(Math.round(rn.sim * 100), 0, 'compareHist disjoint sim 0');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
