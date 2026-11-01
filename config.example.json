@@ -1,1 +1,1 @@
-{"paid":{"maxBnbPerDay":0.1,"maxUsd":10},"qqPushScript":"","rpcs":[],"telegram":{"botToken":"","chatId":"","groupChatId":""},"timeZone":"Asia/Shanghai","wallets":[{"address":"0x7CD09b7BE93813A07bA21680A4552FDa2e35f259","name":"geshi.ai"}]}
+{"paid":{"maxBnbPerDay":0.1,"maxUsd":10},"qqPushScript":"","rpcs":[],"telegram":{"botToken":"","chatId":"","groupChatId":""},"timeZone":"Asia/Shanghai","wallets":[{"address":"0x你的钱包地址","name":"你的 Agent ID 名字"}]}
