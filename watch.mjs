@@ -823,7 +823,7 @@ async function autoMint(c, found, W) {
   if (!gaining) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示拿不到东西'); save(); return '⚪ 预演显示拿不到东西，没有打'; }
   if (mine.some((b) => b.tokenType === 'Erc20' && Number(b.change) > 0) && mine.some((b) => /Erc721|Erc1155/i.test(b.tokenType || '')) && !P.dualAsset) { P.dualAsset = 1; innoCache.delete(c); save(); }
   const x = await W.baw(['contract-call', 'execute', '--requestId', rid]);
-  if (!x.j && /timed? ?out|ETIMEDOUT|killed/i.test(x.t || '')) { P.done[W.name] = 'unknown'; save(); await tg(`⚠️ 免费铸造送出结果不明（超时），先不重打：${P.name || ''}\n${c}`); return '⚠️ 送出结果不明'; }
+  if (!x.j && /timed? ?out|ETIMEDOUT|killed/i.test(x.t || '')) { P.done[W.name] = 'unknown'; save(); if (await projectPushAllowed(c, P)) await tg(`⚠️ 免费铸造送出结果不明（超时），先不重打：${P.name || ''}\n${c}`); return '⚠️ 送出结果不明'; }
   if (!x.j?.success) return noteFail(P, W, '送出失败：' + (x.j?.error?.message || x.t).slice(0, 120));
   P.done[W.name] = 'free';
   P.count = P.count || {};
@@ -846,7 +846,7 @@ async function autoMint(c, found, W) {
   const got = mine.map((b) => (b.tokenType === 'Erc721' ? 'NFT ×1' : b.tokenType + ' +' + b.change)).join('、');
   const info = await infoBlock(c, P).catch(() => `合约：${c}`);
   const msg = `🆓 打了免费项目：${P.name || c.slice(0, 10)}（${W.name}）${got ? '\n到账：' + got : ''}\n${info}${note}\n交易 ${x.j.data?.txHash || x.j.data?.orderId || ''}`;
-  await tg(msg);
+  if (await projectPushAllowed(c, P)) await tg(msg);
   return '🤖 已铸造 ' + (P.name || c.slice(0, 10));
 }
 
