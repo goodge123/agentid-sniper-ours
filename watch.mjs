@@ -641,7 +641,7 @@ async function innovation(c, P) {
   const total = origPts + mechPts + identPts + proofPts;
   const grade = gradeOf(total);
   const hits = [];
-  hits.push(cmp.near ? `原创性 ${origPts}/30：与历史项目「${cmp.near.name || cmp.near.addr.slice(0, 10)}」最像，函数相似度 ${Math.round(cmp.sim * 100)}%` : `原创性 ${origPts}/30：历史库可比项目 ${cmp.base} 个`);
+  hits.push(cmp.near ? `原创性 ${origPts}/30：与历史项目「${cmp.near.name || (cmp.near.addr.slice(0, 10) + '·未命名')}」最像，函数相似度 ${Math.round(cmp.sim * 100)}%` : `原创性 ${origPts}/30：历史库可比项目 ${cmp.base} 个`);
   if (cmp.firstFams.length) hits.push('首现机制：' + cmp.firstFams.join('/'));
   if (cmp.firstSels.length) hits.push(`${cmp.firstSels.length} 个历史未见过的函数`);
   if (fams.length >= 2) hits.push('含机制：' + fams.join('/'));
@@ -880,7 +880,9 @@ async function infoBlock(c, P, withContract = true) {
   const links = await discoverLinks(c, P).catch(() => P.links || {});
   const lines = [];
   if (withContract) lines.push(`合约：${c}（https://bscscan.com/address/${c}）`);
-  lines.push(`官网：${links.site || '未找到'}${links.x ? '｜X：' + links.x : ''}${links.github ? '｜GitHub：' + links.github : ''}`);
+  lines.push(`官网：${links.site || '未找到'}`);
+  lines.push(`X：${links.x || '未找到'}`);
+  if (links.github) lines.push(`GitHub：${links.github}`);
   if (P.narr) lines.push(`叙事：${P.narr.total}/100 ${P.narr.grade} 级｜${P.narr.story || ''}｜概念：${(P.narr.tags || []).join('、') || '—'}`);
   else lines.push(`叙事：${P.narrState || '待评'}`);
   const sg = surgeText(P);
@@ -1047,6 +1049,8 @@ function extractUrls(text) {
   return out;
 }
 const xHandle = (url) => (String(url).match(/(?:twitter\.com|x\.com)\/([\w]+)/i)?.[1] || '').toLowerCase();
+const deadLink = (st) => st === 404 || st === 410;
+function httpStatus(url, hops = 3) { return new Promise((resolve) => { try { const req = httpsRequest(url, { family: 4, timeout: 9000, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => { res.resume(); if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && hops > 0) resolve(httpStatus(new URL(res.headers.location, url).href, hops - 1)); else resolve(res.statusCode || 0); }); req.on('timeout', () => { req.destroy(); resolve(0); }); req.on('error', () => resolve(0)); req.end(); } catch { resolve(0); } }); }
 async function discoverLinks(c, P) {
   const ent = linkCache.get(c);
   if (ent && now() - ent.at < 6 * 3600e3) return ent.links;
@@ -1073,6 +1077,14 @@ async function discoverLinks(c, P) {
     const nm = (P.name || '').toLowerCase();
     if (got && ((nm.length >= 3 && got.html.includes(nm)) || got.html.includes(c.slice(2, 20)))) links.siteOk = 1;
     else links.site = '';
+  }
+  // 链接验活：官网/X/GitHub 返回 404/410 判失效丢弃并记死名单防复活；网络错误不丢（防误杀）；按 URL 只验一次
+  links.val = links.val || {}; links.dead = links.dead || {};
+  for (const f of ['site', 'x', 'github']) {
+    const u = links[f];
+    if (!u) continue;
+    if (links.dead[f] === u) { links[f] = ''; continue; }
+    if (links.val[f] !== u) { const st = await httpStatus(u).catch(() => 0); links.val[f] = u; if (deadLink(st)) { log(`链接验活失效丢弃 ${f} ${u}（HTTP ${st}）`); links[f] = ''; links.dead[f] = u; } }
   }
   const stale = !!(P.links && P.links.v !== 3); // 旧版提取的链接（含库文件垃圾链接）一律覆盖作废
   if (stale || ((links.site || links.x || links.github) && JSON.stringify(links) !== JSON.stringify(P.links || {}))) { P.links = links; save(); }
@@ -1456,6 +1468,7 @@ function runSelfTest() {
   const lu3 = extractUrls('lib https://github.com/Brechtpd/base64/blob/e78/base64.sol and repo https://github.com/agentlings/protocol and post https://x.com/agentlings/status/12345');
   eq(lu3.github, 'https://github.com/agentlings/protocol', 'extractUrls github repo root only');
   eq(lu3.x, '', 'extractUrls x status link rejected');
+  ok(deadLink(404) && deadLink(410) && !deadLink(200) && !deadLink(0) && !deadLink(403), 'deadLink only 404/410');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
