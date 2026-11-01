@@ -780,8 +780,9 @@ async function autoMint(c, found, W) {
     if (au.verdict === 'flag') {
       if (dep && !S.black[dep]) { S.black[dep] = { why: `合约审核硬红旗（${P.name || c.slice(0, 10)}）：${au.hard.join('、')}`, at: now() }; save(); }
       setVerdict(P, '拒绝', '合约审核硬红旗：' + au.hard.join('、'));
-      S.auditNoted = S.auditNoted || {};
-      if (!S.auditNoted[c]) { S.auditNoted[c] = 1; save(); await tg(`🛡 合约审核拦截（免费未打）：${P.name || ''}\n${c}\n红旗：${au.hard.join('、')}${au.impl ? `\n代理实现合约：${au.impl}` : ''}\n源码已验证但有以上风险，按 A 档规矩没有打；你说打才打${dep ? '\n该部署者已记入黑名单，后续项目自动拦' : ''}\nhttps://bscscan.com/address/${c}`); }
+      S.blockList = S.blockList || []; // 拦截只记名单进 6 小时汇总，不再逐个推送（用户 15:11 指令，与无退款同口径）
+      if (!S.blockList.some((x) => x.c === c)) { S.blockList.push({ c, name: P.name || '', flags: au.hard.join('、'), at: now() }); if (S.blockList.length > 500) S.blockList = S.blockList.slice(-500); }
+      save();
       return `🛡 合约审核拦截：${au.hard.join('、')}`;
     }
     if (au.verdict === 'soft') note = '\n（源码已验证，审核提示：' + au.soft.join('、') + '）';
@@ -986,11 +987,15 @@ async function paidSweep() {
   }
 }
 async function noRefDigest() {
-  const fresh = (S.noRefList || []).filter((x) => x.at > (S.noRefDigestAt || 0));
-  if (!fresh.length) return;
+  const since = S.noRefDigestAt || 0;
+  const fresh = (S.noRefList || []).filter((x) => x.at > since);
+  const freshB = (S.blockList || []).filter((x) => x.at > since);
+  if (!fresh.length && !freshB.length) return;
   S.noRefDigestAt = now(); save();
-  const lines = fresh.slice(0, 60).map((x) => `✖ ${x.name || x.c.slice(0, 10)}｜进度 ${x.fp != null ? Math.round(x.fp * 100) + '%' : '—'}｜参与 ${x.agents}｜${x.c}`);
-  await tg(`🔕 无退款不打汇总（共 ${fresh.length} 个，只记名单不逐个推；其中创新/叙事达标的仍会单独提醒，发「项目」可查全部裁决）\n` + lines.join('\n') + (fresh.length > 60 ? `\n……还有 ${fresh.length - 60} 个未列` : ''));
+  let msg = '🔕 不符合汇总（只记名单不逐个推；其中创新/叙事达标的仍会单独提醒，发「项目」可查全部裁决）';
+  if (fresh.length) msg += `\n— 无退款不打 ${fresh.length} 个 —\n` + fresh.slice(0, 60).map((x) => `✖ ${x.name || x.c.slice(0, 10)}｜进度 ${x.fp != null ? Math.round(x.fp * 100) + '%' : '—'}｜参与 ${x.agents}｜${x.c}`).join('\n') + (fresh.length > 60 ? `\n……还有 ${fresh.length - 60} 个未列` : '');
+  if (freshB.length) msg += `\n— 审核拦截 ${freshB.length} 个 —\n` + freshB.slice(0, 40).map((x) => `🛡 ${x.name || x.c.slice(0, 10)}｜${x.flags}｜${x.c}`).join('\n') + (freshB.length > 40 ? `\n……还有 ${freshB.length - 40} 个未列` : '');
+  await tg(msg);
 }
 async function fastLane() {
   // 临近门槛的追踪项加快检查（15 秒一轮）：进度跨过门槛就立刻排队打
