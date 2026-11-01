@@ -628,7 +628,7 @@ async function innovation(c, P) {
   }
   return res;
 }
-async function innoAlert(c, P, extra = '') {
+async function innoAlert(c, P, extra = '', withInfo = true) {
   const inno = await innovation(c, P).catch(() => null);
   if (!inno) return { score: 0, score100: 0, grade: 'C', hard: 0, hits: [] };
   // 成长记录：分数变化 ≥5 或等级变化留一条（最多 10 条）
@@ -644,7 +644,8 @@ async function innoAlert(c, P, extra = '') {
   if (!kind) return inno;
   if ((P.innoTries || 0) >= 5 || now() < (P.innoTryAt || 0)) return inno;
   const star = kind.startsWith('A级') || kind === '创新进展' ? '⭐' : '🔍';
-  const delivered = await tg(`${star} ${kind}：${P.name || ''}（创新评分 ${inno.score100}/90，${inno.grade} 级）\n${c}\n${inno.hits.join('\n')}${extra}\nTG 发「创新」可看全部圈出项目`);
+  const info = withInfo ? await infoBlock(c, P, false).catch(() => '') : '';
+  const delivered = await tg(`${star} ${kind}：${P.name || ''}（创新评分 ${inno.score100}/90，${inno.grade} 级）\n合约：${c}\n${inno.hits.join('\n')}${info ? '\n' + info : ''}${extra}\nTG 发「创新」可看全部圈出项目`);
   P.innoTries = (P.innoTries || 0) + 1;
   if (delivered) { P.innoStage = stageTo; P.innoAlertScore = inno.score100; P.innoTries = 0; P.innoTryAt = 0; }
   else P.innoTryAt = now() + 1800e3; // 未送达：30 分钟后补发，最多 5 次
@@ -807,7 +808,8 @@ async function autoMint(c, found, W) {
   }
   save();
   const got = mine.map((b) => (b.tokenType === 'Erc721' ? 'NFT ×1' : b.tokenType + ' +' + b.change)).join('、');
-  const msg = `🆓 打了免费项目：${P.name || c.slice(0, 10)}（${W.name}）${got ? '\n到账：' + got : ''}\n${c}${note}\n交易 ${x.j.data?.txHash || x.j.data?.orderId || ''}`;
+  const info = await infoBlock(c, P).catch(() => `合约：${c}`);
+  const msg = `🆓 打了免费项目：${P.name || c.slice(0, 10)}（${W.name}）${got ? '\n到账：' + got : ''}\n${info}${note}\n交易 ${x.j.data?.txHash || x.j.data?.orderId || ''}`;
   await tg(msg);
   return '🤖 已铸造 ' + (P.name || c.slice(0, 10));
 }
@@ -826,22 +828,52 @@ async function classifyPaid(c) {
   if (q2 && q2.length >= 66 && BigInt(q2.slice(0, 66)) > 0n) return 'usdt';
   return 'gen';
 }
+function surgeText(P) {
+  // 参与钱包增长：与约 30 分钟前的快照比（快照由 paidSweep 每 5 分钟记一次）
+  const effN = effAgents(P);
+  const g = P.growth || [];
+  if (g.length < 2) return effN > 0 ? `现 ${effN} 个` : '';
+  const target = now() - 1800e3;
+  let base = g[0];
+  for (const s of g) if (s.at <= target) base = s;
+  const mins = Math.max(1, Math.round((now() - base.at) / 60000));
+  const d = effN - base.n;
+  return `近 ${mins} 分钟 ${d >= 0 ? '+' : ''}${d} 个（现 ${effN} 个）`;
+}
+async function infoBlock(c, P, withContract = true) {
+  // 提醒统一信息块：合约、官网、推特、叙事、参与增长
+  const links = await discoverLinks(c, P).catch(() => P.links || {});
+  const lines = [];
+  if (withContract) lines.push(`合约：${c}（https://bscscan.com/address/${c}）`);
+  lines.push(`官网：${links.site || '未找到'}${links.x ? '｜X：' + links.x : ''}${links.github ? '｜GitHub：' + links.github : ''}`);
+  if (P.narr) lines.push(`叙事：${P.narr.total}/100 ${P.narr.grade} 级｜${P.narr.story || ''}｜概念：${(P.narr.tags || []).join('、') || '—'}`);
+  else lines.push(`叙事：${P.narrState || '待评'}`);
+  const sg = surgeText(P);
+  lines.push(`参与：Agent ID 钱包约 ${P.agents || 0} 个${effAgents(P) !== (P.agents || 0) ? `（有效约 ${effAgents(P)} 个）` : ''}${sg ? '｜增长：' + sg : ''}`);
+  return lines.join('\n');
+}
 async function analyzePaid(c, P) {
   const price = await bnbUsd().catch(() => 0);
   const kind = P.kind || 'gen';
-  let unitTxt = '单价读不到，以执行预览为准', maxShares = -1, costTxt = '';
+  let unitTxt = '单价读不到，以执行预览为准', maxShares = -1, costTxt = '', unitRaw = 0;
   try {
     if (kind === 'bnb') {
       const q = await call(c, '0x68bce8cd' + w(1));
       const u = q && q.length >= 66 ? Number(BigInt(q.slice(0, 66))) / 1e18 : 0;
+      if (u > 0) unitRaw = u;
       if (u > 0 && price > 0) { const per = u * 1.005 * price; maxShares = Math.max(0, Math.min(10, Math.floor(OUR.paidMaxUsd / per))); unitTxt = `约 ${u.toFixed(5)} BNB/份（约 ${per.toFixed(2)}U/份）`; costTxt = maxShares > 0 ? `按 ${OUR.paidMaxUsd}U 上限最多 ${maxShares} 份，总成本约 ${(per * maxShares).toFixed(2)}U` : '1 份就超过付费上限'; }
     } else if (kind === 'usdt') {
       const q = await call(c, '0x725c4058' + w(1));
       const u = q && q.length >= 66 ? Number(BigInt(q.slice(0, 66))) / 1e18 : 0;
-      if (u > 0) { maxShares = Math.max(0, Math.min(10, Math.floor(OUR.paidMaxUsd / u))); unitTxt = `约 ${u.toFixed(2)} USDT/份`; costTxt = maxShares > 0 ? `按 ${OUR.paidMaxUsd}U 上限最多 ${maxShares} 份，总成本约 ${(u * maxShares).toFixed(2)}U` : '1 份就超过付费上限'; }
+      if (u > 0) { unitRaw = u; maxShares = Math.max(0, Math.min(10, Math.floor(OUR.paidMaxUsd / u))); unitTxt = `约 ${u.toFixed(2)} USDT/份`; costTxt = maxShares > 0 ? `按 ${OUR.paidMaxUsd}U 上限最多 ${maxShares} 份，总成本约 ${(u * maxShares).toFixed(2)}U` : '1 份就超过付费上限'; }
     }
   } catch {}
   const { sold, cap } = await readSoldCap(c).catch(() => ({ sold: null, cap: null }));
+  let paidTxt = '';
+  if (sold != null && unitRaw > 0) {
+    if (kind === 'bnb') paidTxt = `已付约 ${(sold * unitRaw).toFixed(4)} BNB${price > 0 ? `（约 ${(sold * unitRaw * price).toFixed(1)}U）` : ''}（已售 ${sold} 份 × 单价）`;
+    else if (kind === 'usdt') paidTxt = `已付约 ${(sold * unitRaw).toFixed(1)} USDT（已售 ${sold} 份 × 单价）`;
+  }
   const progress = await readProgress(c);
   const dep = P.deployer || '';
   const black = dep && S.black[dep] ? S.black[dep].why : '';
@@ -862,24 +894,30 @@ async function analyzePaid(c, P) {
   else if (pool) { verdict = '观望'; reason = '已经开池，铸造价可能不如市价，要先比价'; }
   else { verdict = '可以打'; reason = '有退款保本、进度过门槛、参与人数够、未见合约风险'; }
   setVerdict(P, verdict === '可以打' ? '通过' : verdict === '观望' ? '观察' : '拒绝', reason);
+  if (NARR() && !P.narr) await narrativeEval(c, P).catch(() => {});
+  const info = await infoBlock(c, P, false).catch(() => '');
   const inno = await innovation(c, P).catch(() => ({ score: 0, hits: [] }));
   log(`付费分析 ${P.name || c}：${verdict}——${reason}`);
   await tg(`🔔 付费项目分析：${P.name || c.slice(0, 10)}（进度 ${progress != null ? Math.round(progress * 100) + '%' : '读不到'}${sold != null && cap ? `，已售 ${sold}/${cap}` : ''}）
 合约：${c}
 类型：${{ bnb: 'BNB 报价型', usdt: 'USDT 份额型', gen: 'NFT 单价型' }[kind] || kind}
-单价：${unitTxt}${costTxt ? `\n成本：${costTxt}` : ''}
-参与：Agent ID 钱包约 ${agents} 个${eff !== agents ? `（同块批量打折后有效约 ${eff} 个）` : ''}${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
+单价：${unitTxt}${costTxt ? `\n成本：${costTxt}` : ''}${paidTxt ? `\n付费：${paidTxt}` : ''}
+${info}${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
 创新：${inno.grade} 级 ${inno.score100}/90${inno.hits.length ? '（' + inno.hits.slice(0, 3).join('；') + '）' : ''}
 保本：合约有退款函数 ✓${pool ? '\n状态：已开池' : ''}${rn}
 合约审核：${au.verdict === 'clean' ? '源码已验证、未见红旗' : au.verdict === 'flag' ? '源码已验证但有红旗：' + au.hard.join('、') : au.verdict === 'soft' ? '源码已验证，审核提示：' + au.soft.join('、') : '源码未验证'}
 结论：${verdict}——${reason}
 要打回主聊天告诉我打哪个、多少份，我先预览报总成本和每份到账，你确认了才执行；不回就不打`);
-  await innoAlert(c, P, `\n付费结论：${verdict}——${reason}`);
+  await innoAlert(c, P, `\n付费结论：${verdict}——${reason}`, false);
 }
 async function paidSweep() {
   for (const [c, P] of Object.entries(S.track)) {
     try {
       if (now() - (P.at || 0) > 3 * 86400e3) continue;
+      // 参与增长快照：每 5 分钟记一次有效参与数，留最近 1 小时（供 surgeText 算激增）
+      P.growth = P.growth || [];
+      const lastG = P.growth[P.growth.length - 1];
+      if (!lastG || now() - lastG.at >= 300e3) { P.growth.push({ at: now(), n: effAgents(P) }); if (P.growth.length > 12) P.growth = P.growth.slice(-12); }
       if (WALLETS.every((W) => mintClosed(P, W))) continue;
       const fp = await readProgress(c);
       if (fp != null) P.progress = fp;
@@ -1012,7 +1050,7 @@ async function narrativeAlert(c, P, links) {
   if (!kind) return;
   if ((P.narrTries || 0) >= 5 || now() < (P.narrTryAt || 0)) return;
   const star = kind.includes('A级') || kind === '叙事进展' ? '🌐⭐' : '🌐';
-  const delivered = await tg(`${star} ${kind}：${P.name || ''}（叙事评分 ${n.total}/100，${n.grade} 级）\n${c}\n项目讲什么：${n.story || '官网未说清'}\n五维：新颖 ${n.parts.novelty}/30｜价值 ${n.parts.value}/25｜可信 ${n.parts.cred}/20｜社区 ${n.parts.community}/15｜传播 ${n.parts.spread}/10\n证据：${n.evidence.join('；')}\n概念：${n.tags.join('、') || '—'}\n官网：${links.site}${links.x ? '\nX：' + links.x + (links.xVerified ? '（官网互链已确认）' : '（归属未确认）') : ''}${links.github ? '\nGitHub：' + links.github : ''}\n注：叙事分只代表故事与证据，不代表合约安全或投资价值，铸造仍走原审核`);
+  const delivered = await tg(`${star} ${kind}：${P.name || ''}（叙事评分 ${n.total}/100，${n.grade} 级）\n合约：${c}（https://bscscan.com/address/${c}）\n参与增长：${surgeText(P) || '—'}\n项目讲什么：${n.story || '官网未说清'}\n五维：新颖 ${n.parts.novelty}/30｜价值 ${n.parts.value}/25｜可信 ${n.parts.cred}/20｜社区 ${n.parts.community}/15｜传播 ${n.parts.spread}/10\n证据：${n.evidence.join('；')}\n概念：${n.tags.join('、') || '—'}\n官网：${links.site}${links.x ? '\nX：' + links.x + (links.xVerified ? '（官网互链已确认）' : '（归属未确认）') : ''}${links.github ? '\nGitHub：' + links.github : ''}\n注：叙事分只代表故事与证据，不代表合约安全或投资价值，铸造仍走原审核`);
   P.narrTries = (P.narrTries || 0) + 1;
   if (delivered) { P.narrStage = stageTo; P.narrAlertScore = n.total; P.narrTries = 0; P.narrTryAt = 0; }
   else P.narrTryAt = now() + 1800e3;
@@ -1342,6 +1380,8 @@ function runSelfTest() {
   const tc = tagCounts({ a: { narr: { at: now(), tags: ['Agent协作'] }, innoGrade: 'B' }, b: { narr: { at: now(), tags: ['Agent协作'] } } }, 86400e3);
   eq(tc['Agent协作'].n, 2, 'tagCounts n=2');
   eq(tc['Agent协作'].proven, 1, 'tagCounts proven=1');
+  const sgP = { agents: 10, growth: [{ at: Date.now() - 1800e3, n: 4 }, { at: Date.now() - 300e3, n: 9 }] };
+  eq(surgeText(sgP), '近 30 分钟 +6 个（现 10 个）', 'surgeText 30min delta');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
