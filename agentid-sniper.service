@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentID Sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agentid-sniper-ours
+ExecStart=/usr/bin/node watch.mjs
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
