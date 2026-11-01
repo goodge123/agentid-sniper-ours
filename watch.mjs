@@ -677,6 +677,7 @@ async function innoAlertInner(c, P, extra = '', withInfo = true) {
   else if ((P.innoStage || 0) >= 2 && (P.innoStage || 0) < 3 && inno.score100 >= (P.innoAlertScore || 0) + 10) { kind = '创新进展'; stageTo = 3; }
   if (!kind) return inno;
   if ((P.innoTries || 0) >= 5 || now() < (P.innoTryAt || 0)) return inno;
+  if (!(await projectPushAllowed(c, P))) return inno; // 官网/X/GitHub 三样全无：不推，分数与成长记录照常保留
   const star = kind.startsWith('A级') || kind === '创新进展' ? '⭐' : '🔍';
   const info = withInfo ? await infoBlock(c, P, false).catch(() => '') : '';
   const delivered = await tg(`${star} ${kind}：${P.name || ''}（创新评分 ${inno.score100}/90，${inno.grade} 级）\n合约：${c}\n${inno.hits.join('\n')}${info ? '\n' + info : ''}${extra}\nTG 发「创新」可看全部圈出项目`);
@@ -759,7 +760,7 @@ async function autoMint(c, found, W) {
   // 部署者筛选：黑名单直接拦（黑名单由审核硬红旗自动入册，见审核门）
   const dep = P.deployer || '';
   if (dep && S.black[dep]) {
-    if (P.verdict?.s !== '拒绝') await tg(`⛔ 部署者在黑名单，免费未打：${P.name || ''}\n${c}\n部署者 ${dep}\n入册原因：${S.black[dep].why}`);
+    if (P.verdict?.s !== '拒绝' && (await projectPushAllowed(c, P))) await tg(`⛔ 部署者在黑名单，免费未打：${P.name || ''}\n${c}\n部署者 ${dep}\n入册原因：${S.black[dep].why}`);
     setVerdict(P, '拒绝', '部署者黑名单：' + S.black[dep].why);
     return '⛔ 部署者在黑名单，没有打';
   }
@@ -793,7 +794,7 @@ async function autoMint(c, found, W) {
       if (ge && BigInt(ge) > OUR.gasCap) {
         S.auditNoted = S.auditNoted || {};
         const gk = c + '|gas';
-        if (!S.auditNoted[gk]) { S.auditNoted[gk] = 1; save(); await tg(`🛡 gas 估算异常拦截（免费未打）：${P.name || ''}\n${c}\n估算约 ${Number(BigInt(ge)).toLocaleString('en-US')}，超过拦截线 ${OUR.gasCap.toLocaleString('en-US')}\nhttps://bscscan.com/address/${c}`); }
+        if (!S.auditNoted[gk]) { S.auditNoted[gk] = 1; save(); if (await projectPushAllowed(c, P)) await tg(`🛡 gas 估算异常拦截（免费未打）：${P.name || ''}\n${c}\n估算约 ${Number(BigInt(ge)).toLocaleString('en-US')}，超过拦截线 ${OUR.gasCap.toLocaleString('en-US')}\nhttps://bscscan.com/address/${c}`); }
         setVerdict(P, '拒绝', `gas 估算异常（约 ${Number(BigInt(ge)).toLocaleString('en-US')}）`);
         return `🛡 gas 估算异常（约 ${Number(BigInt(ge)).toLocaleString('en-US')}）`;
       }
@@ -934,6 +935,7 @@ async function analyzePaid(c, P) {
   if (NARR() && !P.narr) await narrativeEval(c, P).catch(() => {});
   const info = await infoBlock(c, P, false).catch(() => '');
   const inno = await innovation(c, P).catch(() => ({ score: 0, hits: [] }));
+  if (!(await projectPushAllowed(c, P))) { log(`付费分析 ${P.name || c}：${verdict}——${reason}（无官网/X/GitHub，不推送）`); return; }
   log(`付费分析 ${P.name || c}：${verdict}——${reason}`);
   await tg(`🔔 付费项目分析：${P.name || c.slice(0, 10)}（进度 ${progress != null ? Math.round(progress * 100) + '%' : '读不到'}${sold != null && cap ? `，已售 ${sold}/${cap}` : ''}）
 合约：${c}
@@ -994,7 +996,7 @@ async function noRefDigest() {
   const freshB = (S.blockList || []).filter((x) => x.at > since);
   if (!fresh.length && !freshB.length) return;
   S.noRefDigestAt = now(); save();
-  let msg = '🔕 不符合汇总（只记名单不逐个推；其中创新/叙事达标的仍会单独提醒，发「项目」可查全部裁决）';
+  let msg = '🔕 不符合汇总（只记名单不逐个推；其中有官网/X/GitHub 任一且创新/叙事达标的仍会单独提醒，发「项目」可查全部裁决）';
   if (fresh.length) msg += `\n— 无退款不打 ${fresh.length} 个 —\n` + fresh.slice(0, 60).map((x) => `✖ ${x.name || x.c.slice(0, 10)}｜进度 ${x.fp != null ? Math.round(x.fp * 100) + '%' : '—'}｜参与 ${x.agents}｜${x.c}`).join('\n') + (fresh.length > 60 ? `\n……还有 ${fresh.length - 60} 个未列` : '');
   if (freshB.length) msg += `\n— 审核拦截 ${freshB.length} 个 —\n` + freshB.slice(0, 40).map((x) => `🛡 ${x.name || x.c.slice(0, 10)}｜${x.flags}｜${x.c}`).join('\n') + (freshB.length > 40 ? `\n……还有 ${freshB.length - 40} 个未列` : '');
   await tg(msg);
@@ -1050,6 +1052,14 @@ function extractUrls(text) {
 }
 const xHandle = (url) => (String(url).match(/(?:twitter\.com|x\.com)\/([\w]+)/i)?.[1] || '').toLowerCase();
 const deadLink = (st) => st === 404 || st === 410;
+const hasPublicLinks = (links) => !!(links?.site || links?.x || links?.github);
+async function projectPushAllowed(c, P) {
+  // 用户 15:39 指令：官网、X、GitHub 三样全无的项目不主动推送，只后台记录
+  const links = await discoverLinks(c, P).catch(() => P.links || {});
+  if (hasPublicLinks(links)) return true;
+  if (P && !P.noPublicLinksAt) { P.noPublicLinksAt = now(); save(); log(`项目无官网/X/GitHub，跳过推送 ${P.name || c}`); }
+  return false;
+}
 function httpStatus(url, hops = 3) { return new Promise((resolve) => { try { const req = httpsRequest(url, { family: 4, timeout: 9000, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => { res.resume(); if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && hops > 0) resolve(httpStatus(new URL(res.headers.location, url).href, hops - 1)); else resolve(res.statusCode || 0); }); req.on('timeout', () => { req.destroy(); resolve(0); }); req.on('error', () => resolve(0)); req.end(); } catch { resolve(0); } }); }
 async function discoverLinks(c, P) {
   const ent = linkCache.get(c);
@@ -1469,6 +1479,7 @@ function runSelfTest() {
   eq(lu3.github, 'https://github.com/agentlings/protocol', 'extractUrls github repo root only');
   eq(lu3.x, '', 'extractUrls x status link rejected');
   ok(deadLink(404) && deadLink(410) && !deadLink(200) && !deadLink(0) && !deadLink(403), 'deadLink only 404/410');
+  ok(!hasPublicLinks({ site: '', x: '', github: '' }) && hasPublicLinks({ site: 'https://a.fun' }) && hasPublicLinks({ x: 'https://x.com/a' }) && hasPublicLinks({ github: 'https://github.com/a/b' }), 'hasPublicLinks any one is enough');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
