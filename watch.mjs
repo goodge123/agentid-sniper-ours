@@ -1035,7 +1035,7 @@ async function innoSweep() {
 const NARR = () => (CONFIG.narrative?.apiKey ? CONFIG.narrative : null);
 const narrGradeOf = (t) => (t >= 70 ? 'A' : t >= 45 ? 'B' : 'C');
 const linkCache = new Map();
-const URL_DENY = /(eips\.ethereum\.org|ethereum\.org|soliditylang\.org|openzeppelin\.com|wikipedia\.org|readthedocs|github\.com\/(ethereum|OpenZeppelin|foundry-rs|smartcontractkit)\b|gnu\.org|apache\.org\/licenses|creativecommons)/i;
+const URL_DENY = /(eips\.ethereum\.org|ethereum\.org|soliditylang\.org|openzeppelin\.com|wikipedia\.org|readthedocs|github\.com\/(ethereum|OpenZeppelin|foundry-rs|smartcontractkit)\b|gnu\.org|apache\.org\/licenses|creativecommons|w3\.org)/i; // w3.org 是 SVG/XML 命名空间地址，不是官网（MOD 项目实测踩过）
 function extractUrls(text) {
   const out = { site: '', x: '', github: '' };
   if (!text) return out;
