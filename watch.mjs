@@ -541,6 +541,8 @@ function keccak256(bytes) {
 }
 const sigSel = (sig) => keccak256(Buffer.from(sig, 'utf8')).slice(0, 8);
 const KNOWN_SEL = new Set(['1249c58b', '5b70ea9f', '4e71d92d', 'a0712d68', '26092b83', '74d04cfc', '9f92d0dd', '7c928fe9', '379607f5', '8ab53447', 'f366afc9', '1be3587a', '70a08231', 'a9059cbb', '095ea7b3', '23b872dd', 'dd62ed3e', '18160ddd', '06fdde03', '95d89b41', '313ce567', '8da5cb5b', '715018a6', 'f2fde38b', '40c10f19', '8456cb59', '3f4ba83a', '6352211e', '081812fc', 'b88d4fde', 'a22cb465', 'e985e9c5', '01ffc9a7', '80ac58cd', '68bce8cd', '725c4058', '590e1ae3', 'b5545a3c', '278ecde1', '5b7baf64', '110f8874', '16bfe25c', '38e771ab', 'b2d5ae44', 'fa89401a', 'bffa55d5', '68ec0d99', '74c1b1c9', 'b30196e5', 'c033a490', '4c4a386f', 'd233e4eb']);
+const MECH_FAMS = [['质押', /stake|staking/i], ['销毁', /\bburn\b|burnable/i], ['联合曲线', /bonding|\bcurve\b/i], ['纪元/赛季', /epoch|season/i], ['任务', /quest/i], ['投票治理', /voting|\bvote\b|governor/i], ['复投/收割', /compound|harvest/i], ['借贷', /lending|\bborrow\b/i]];
+const mechFams = (src) => MECH_FAMS.filter(([, re]) => re.test(src)).map(([name]) => name);
 const innoCache = new Map();
 async function innovation(c, P) {
   if (innoCache.has(c)) return innoCache.get(c);
@@ -558,7 +560,16 @@ async function innovation(c, P) {
       }
       const novel = [...sels].filter((s) => !KNOWN_SEL.has(s));
       if (novel.length >= 3) { score++; hits.push(`有 ${novel.length} 个非常规函数（自有机制）`); }
+      const fams = mechFams(src);
+      if (fams.length >= 2) { score++; hits.push('含专有机制：' + fams.join('/')); }
     }
+    if (P?.dualAsset) { score++; hits.push('铸造同时产出代币与 NFT'); }
+    try {
+      const tk = await tokenOf(c).catch(() => c);
+      const impl = await logicAddr(c).catch(() => c);
+      const pieces = 1 + (LC(tk) !== LC(c) ? 1 : 0) + (impl && impl !== LC(c) ? 1 : 0);
+      if (pieces >= 3) { score++; hits.push('成套架构（代理+独立代币+铸造合约）'); }
+    } catch {}
     const learnedSels = new Set((S.learned?.[c] || []).map((d) => d.slice(0, 10).toLowerCase()));
     if (learnedSels.size >= 2) { score++; hits.push('Agent ID 钱包有多种交互方式（不止铸造）'); }
     if (await hasRefund(c)) { score++; hits.push('带退款保本机制'); }
@@ -708,6 +719,7 @@ async function autoMint(c, found, W) {
   if (losing.length) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示会扣资产'); save(); return '⚠️ 预演显示会扣你的资产，没有打'; }
   const gaining = mine.some((b) => Number(b.change) > 0 || /Erc721|Erc1155/i.test(b.tokenType || ''));
   if (!gaining) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示拿不到东西'); save(); return '⚪ 预演显示拿不到东西，没有打'; }
+  if (mine.some((b) => b.tokenType === 'Erc20' && Number(b.change) > 0) && mine.some((b) => /Erc721|Erc1155/i.test(b.tokenType || '')) && !P.dualAsset) { P.dualAsset = 1; innoCache.delete(c); save(); }
   const x = await W.baw(['contract-call', 'execute', '--requestId', rid]);
   if (!x.j && /timed? ?out|ETIMEDOUT|killed/i.test(x.t || '')) { P.done[W.name] = 'unknown'; save(); await tg(`⚠️ 免费铸造送出结果不明（超时），先不重打：${P.name || ''}\n${c}`); return '⚠️ 送出结果不明'; }
   if (!x.j?.success) return noteFail(P, W, '送出失败：' + (x.j?.error?.message || x.t).slice(0, 120));
@@ -715,6 +727,7 @@ async function autoMint(c, found, W) {
   P.count = P.count || {};
   P.count[W.name] = (P.count[W.name] || 0) + 1;
   setVerdict(P, '通过', `免费铸造成功（共 ${P.count[W.name]} 份）`);
+  if (P.dualAsset) await innoAlert(c, P);
   if (P.failCnt) delete P.failCnt[W.name];
   if (P.retryAt) delete P.retryAt[W.name];
   S.mintCnt[W.name] = (S.mintCnt[W.name] || 0) + 1;
@@ -1096,6 +1109,8 @@ function runSelfTest() {
   eq(sigSel('transfer(address,uint256)'), 'a9059cbb', 'sigSel transfer');
   eq(sigSel('balanceOf(address)'), '70a08231', 'sigSel balanceOf');
   ok(KNOWN_SEL.has(sigSel('mint()')), 'mint() is a known selector');
+  eq(mechFams('function stake(uint n) public {} function burn(uint n) public {}').length, 2, 'mechFams two families');
+  eq(mechFams('function mint() public {}').length, 0, 'mechFams plain template none');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
