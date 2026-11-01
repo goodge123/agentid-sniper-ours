@@ -4,12 +4,15 @@
 // 持仓自动止盈：3 倍卖出回本+50% 利润，从高点回落 40% 全卖（用户 2026-11-01 定）。
 // 执行统一走币安 Agentic Wallet（baw），本程序不碰私钥。
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
-const CONFIG = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8'));
+const SELFTEST = process.argv.includes('--selftest');
+let CONFIG;
+try { CONFIG = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8')); }
+catch (e) { if (!SELFTEST) throw e; CONFIG = { wallets: [], paid: {}, timeZone: 'Asia/Shanghai' }; }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 const LC = (a) => String(a || '').toLowerCase();
@@ -41,8 +44,14 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 // ---------- 状态（单文件 JSON，防写坏：临时文件 + 改名） ----------
 mkdirSync(join(DIR, 'data'), { recursive: true });
 const STATE_FILE = join(DIR, 'data', 'state.json');
-let S = {};
-try { S = JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch {}
+function parseState(txt) { try { const o = JSON.parse(txt); return o && typeof o === 'object' ? o : null; } catch { return null; } }
+let S = existsSync(STATE_FILE) ? parseState(readFileSync(STATE_FILE, 'utf8')) : null;
+if (!S) {
+  // 主文件损坏：原件改名留证，尝试用 .bak 恢复
+  try { if (existsSync(STATE_FILE)) renameSync(STATE_FILE, STATE_FILE + '.corrupt-' + Date.now()); } catch {}
+  S = (existsSync(STATE_FILE + '.bak') ? parseState(readFileSync(STATE_FILE + '.bak', 'utf8')) : null) || {};
+  if (Object.keys(S).length) console.error('state.json 损坏，已从 state.json.bak 恢复');
+}
 S.track = S.track || {};       // 追踪中的合约： addr -> {name, at, agents, progress, done:{wallet:status}, kind, ...}
 S.hold = S.hold || [];         // 持仓： {sym, addr, cost(USD), only, openPx, flags:{}}
 S.black = S.black || {};       // 部署者黑名单： addr -> {why, at}
@@ -52,7 +61,12 @@ function save() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try { const t = STATE_FILE + '.tmp'; writeFileSync(t, JSON.stringify(S)); renameSync(t, STATE_FILE); } catch {}
+    try {
+      const t = STATE_FILE + '.tmp';
+      writeFileSync(t, JSON.stringify(S));
+      try { if (existsSync(STATE_FILE) && parseState(readFileSync(STATE_FILE, 'utf8'))) copyFileSync(STATE_FILE, STATE_FILE + '.bak'); } catch {}
+      renameSync(t, STATE_FILE);
+    } catch {}
   }, 800);
 }
 function log(msg) {
@@ -62,7 +76,7 @@ function log(msg) {
 
 // 单实例锁：已有同目录实例在跑就退出（防双开重复打）
 const LOCK_FILE = join(DIR, 'data', 'lock');
-try {
+if (!SELFTEST) try {
   if (existsSync(LOCK_FILE)) {
     const pid = Number(readFileSync(LOCK_FILE, 'utf8'));
     if (pid && pid !== process.pid) { try { process.kill(pid, 0); console.error('已有实例在跑 pid=' + pid); process.exit(1); } catch {} }
@@ -176,7 +190,7 @@ function makeBaw() {
   });
 }
 const WALLETS = (CONFIG.wallets || []).map((wc) => ({ name: wc.name, addr: LC(wc.address), baw: makeBaw() }));
-if (!WALLETS.length) { console.error('config.json 里没有 wallets'); process.exit(1); }
+if (!WALLETS.length && !SELFTEST) { console.error('config.json 里没有 wallets'); process.exit(1); }
 const ME = WALLETS[0];
 
 // ---------- 价格：BNB/USD 读 Pancake 主池储备 ----------
@@ -366,15 +380,17 @@ async function trackNew(c, deployer, why) {
 }
 const checkedCode = new Set();
 async function scanBlocks(from, to) {
+  const failed = [];
   for (let b = from; b <= to; b++) {
     const blk = await rpc('eth_getBlockByNumber', ['0x' + b.toString(16), true]).catch(() => null);
-    if (!blk) continue;
+    if (!blk) { failed.push(b); continue; }
     for (const tx of blk.transactions || []) {
       try {
         const to = tx.to ? LC(tx.to) : '';
         const fromA = LC(tx.from);
         if (!to) {
           const rc = await rpc('eth_getTransactionReceipt', [tx.hash]).catch(() => null);
+          if (!rc) { if (!failed.includes(b)) failed.push(b); continue; }
           const ca = rc?.contractAddress ? LC(rc.contractAddress) : '';
           if (ca && !S.track[ca] && !checkedCode.has(ca)) { checkedCode.add(ca); if (await isAgentContract(ca)) await trackNew(ca, fromA, '新部署'); }
           continue;
@@ -408,6 +424,7 @@ async function scanBlocks(from, to) {
       } catch {}
     }
   }
+  return failed;
 }
 const bgJobs = new Set();
 function bgJob(fn) { const p = Promise.resolve().then(fn).catch(() => {}); bgJobs.add(p); p.finally(() => bgJobs.delete(p)); }
@@ -474,35 +491,56 @@ async function riskNote(c) {
 // ---------- 免费执行：时机门槛 -> 审核门 -> gas -> baw 预览 -> 执行 ----------
 const mintQueues = new Map();
 const mintQueued = new Set();
+const mintClosed = (P, W) => { const d = P?.done?.[W.name]; return (d && d !== 'free') || (P?.count?.[W.name] || 0) >= 10; };
+function noteFail(P, W, why) {
+  // 临时失败：记次数，2 分钟后重试；连续 3 次才放弃（记 fail）
+  P.failCnt = P.failCnt || {};
+  P.failCnt[W.name] = (P.failCnt[W.name] || 0) + 1;
+  if (P.failCnt[W.name] >= 3) { P.done[W.name] = 'fail'; save(); return '❌ 连续失败 3 次，放弃：' + why; }
+  P.retryAt = P.retryAt || {};
+  P.retryAt[W.name] = now() + 120e3;
+  save();
+  return `⏸ 临时失败（第 ${P.failCnt[W.name]} 次），2 分钟后重试：${why}`;
+}
 function queueMint(c, found, W) {
   const key = c + '|' + W.name;
   if (mintQueued.has(key)) return;
   const P = S.track[c];
-  if (P?.done?.[W.name]) return;
+  if (mintClosed(P, W)) return;
+  if ((P?.retryAt?.[W.name] || 0) > now()) return;
   mintQueued.add(key);
   const prev = mintQueues.get(W.name) || Promise.resolve();
   const job = prev.then(() => autoMintMax(c, found, W)).catch((e) => log(`铸造异常 ${c} ${e.message}`)).finally(() => mintQueued.delete(key));
   mintQueues.set(W.name, job);
 }
 async function autoMintMax(c, found, W) {
+  const P = S.track[c] || (S.track[c] = { at: now(), name: '', done: {}, agents: 0 });
   let n = 0;
   let first = '';
-  while (n < 10) {
+  while ((P.count?.[W.name] || 0) < 10) {
+    if ((P.count?.[W.name] || 0) > 0) {
+      // 连打前复探：同一 calldata 零金额还过才继续；revert = 额度/门禁没了，停；其他错误记 more，稍后重试
+      try { await rpc('eth_call', [{ from: W.addr, to: c, data: found.data, value: '0x0' }, 'latest']); }
+      catch (e) {
+        if (!/revert/i.test(e.message || '')) { P.moreTries = (P.moreTries || 0) + 1; if (P.moreTries < 5) P.more = 1; else delete P.more; save(); }
+        break;
+      }
+      await sleep(5000);
+    }
     const m = await autoMint(c, found, W);
     if (!first) first = m;
     if (!m.startsWith('🤖')) break;
     n++;
-    if (n >= 10) break;
-    // 连打条件：同一 calldata 零金额再试还过才继续（付费/限额自然会失败停下）
-    await sleep(5000);
-    try { await rpc('eth_call', [{ from: W.addr, to: c, data: found.data, value: '0x0' }, 'latest']); } catch { break; }
+    P.moreTries = 0;
+    if (P.more) { delete P.more; save(); }
   }
   return n > 1 ? first + `\n（同一钱包共打了 ${n} 份）` : first;
 }
 function todayKey() { return new Date().toDateString(); }
 async function autoMint(c, found, W) {
   const P = S.track[c] || (S.track[c] = { at: now(), name: '', done: {}, agents: 0 });
-  if (P.done[W.name]) return '✅ 这个钱包已经打过';
+  if (P.done[W.name] && P.done[W.name] !== 'free') return '✅ 这个钱包已经打过';
+  if ((P.count?.[W.name] || 0) >= 10) return '✅ 这个钱包已打满 10 份';
   // 时机门槛
   const fp = await readProgress(c);
   if (fp != null && fp < OUR.goPct) { P.waitHot = 1; save(); return `⏸ 进度 ${Math.floor(fp * 100)}%，未到 ${Math.round(OUR.goPct * 100)}%，先追踪`; }
@@ -543,7 +581,7 @@ async function autoMint(c, found, W) {
   // baw 预览：必须通过模拟且真能拿到东西、无授权变化、不多扣资产
   const p = await W.baw(['contract-call', 'preview', '--binanceChainId', '56', '--from', W.addr, '--to', c, '--value', '0', '--inputData', found.data]);
   const sim = p.j?.data?.simulationResult, rid = p.j?.data?.requestId;
-  if (!p.j?.success || !rid) { P.done[W.name] = 'fail'; save(); return '❌ 预演失败，没有打：' + (p.j?.error?.message || '').slice(0, 120); }
+  if (!p.j?.success || !rid) return noteFail(P, W, '预演请求失败：' + (p.j?.error?.message || '无响应').slice(0, 120));
   if (sim?.allowanceChanges?.length || sim?.authorityChanges?.length) { P.done[W.name] = 'fail'; save(); return '⚠️ 预演显示有授权变化，没有打'; }
   const mine = (sim?.balanceChanges || []).filter((b) => LC(b.owner) === W.addr);
   const losing = mine.filter((b) => Number(b.change) < 0);
@@ -552,8 +590,12 @@ async function autoMint(c, found, W) {
   if (!gaining) { P.done[W.name] = 'fail'; save(); return '⚪ 预演显示拿不到东西，没有打'; }
   const x = await W.baw(['contract-call', 'execute', '--requestId', rid]);
   if (!x.j && /timed? ?out|ETIMEDOUT|killed/i.test(x.t || '')) { P.done[W.name] = 'unknown'; save(); await tg(`⚠️ 免费铸造送出结果不明（超时），先不重打：${P.name || ''}\n${c}`); return '⚠️ 送出结果不明'; }
-  if (!x.j?.success) { P.done[W.name] = 'fail'; save(); return '❌ 送出失败：' + (x.j?.error?.message || x.t).slice(0, 120); }
+  if (!x.j?.success) return noteFail(P, W, '送出失败：' + (x.j?.error?.message || x.t).slice(0, 120));
   P.done[W.name] = 'free';
+  P.count = P.count || {};
+  P.count[W.name] = (P.count[W.name] || 0) + 1;
+  if (P.failCnt) delete P.failCnt[W.name];
+  if (P.retryAt) delete P.retryAt[W.name];
   S.mintCnt[W.name] = (S.mintCnt[W.name] || 0) + 1;
   save();
   // 到账登记持仓（ERC20 成本 0 进信号监控；NFT 记系列）
@@ -634,13 +676,15 @@ async function paidSweep() {
   for (const [c, P] of Object.entries(S.track)) {
     try {
       if (now() - (P.at || 0) > 3 * 86400e3) continue;
-      if (WALLETS.every((W) => P.done?.[W.name])) continue;
+      if (WALLETS.every((W) => mintClosed(P, W))) continue;
       const fp = await readProgress(c);
       if (fp != null) P.progress = fp;
       // 免费的随时捡漏：能免费打就排队（执行链自带门槛）
       let freeFound = null;
       for (const W of WALLETS) {
-        if (P.done?.[W.name]) continue;
+        if (mintClosed(P, W)) continue;
+        if (P.done?.[W.name] === 'free' && !P.more) continue;
+        if ((P.retryAt?.[W.name] || 0) > now()) continue;
         const ff = await findFree(W, c).catch(() => null);
         if (ff) { freeFound = true; queueMint(c, ff, W); }
       }
@@ -665,12 +709,14 @@ async function fastLane() {
   // 临近门槛的追踪项加快检查（15 秒一轮）：进度跨过门槛就立刻排队打
   for (const [c, P] of Object.entries(S.track)) {
     try {
-      if (!P.waitHot || WALLETS.every((W) => P.done?.[W.name])) continue;
+      if (!P.waitHot || WALLETS.every((W) => mintClosed(P, W))) continue;
       const fp = await readProgress(c);
       if (fp != null) P.progress = fp;
       if (fp != null && fp >= 0.45) {
         for (const W of WALLETS) {
-          if (P.done?.[W.name]) continue;
+          if (mintClosed(P, W)) continue;
+          if (P.done?.[W.name] === 'free' && !P.more) continue;
+          if ((P.retryAt?.[W.name] || 0) > now()) continue;
           const ff = await findFree(W, c).catch(() => null);
           if (ff) queueMint(c, ff, W);
         }
@@ -678,6 +724,9 @@ async function fastLane() {
     } catch {}
   }
 }
+
+const median = (a) => { const s = [...a].sort((p, q) => p - q); return s[Math.floor(s.length / 2)]; };
+const tpFrac = (x, cost) => (cost > 0 ? Math.min(1, (1 + OUR.tpProfit) / x) : 0.5);
 
 // ---------- 持仓：自动止盈 + 倍数/流动性信号 ----------
 async function dexPrice(addr) {
@@ -697,17 +746,22 @@ async function holdWatch() {
       const d = await dexPrice(t.addr);
       if (!d || !d.px) continue;
       t.flags = t.flags || {};
-      if (!t.openPx) { t.openPx = d.px; save(); }
-      const base = t.cost > 0 ? t.cost : t.openPx;
-      if (!base) continue;
-      const x = d.px / base;
-      t.peak = Math.max(t.peak || 0, x);
+      // 免费币基准价：头 3 次读价取中位数锁定，避开开池头几分钟的乱价；锁定前不算倍数、不触发止盈
+      if (!(t.cost > 0) && !t.baseLocked) {
+        t.pxHist = t.pxHist || [];
+        t.pxHist.push(d.px);
+        if (t.pxHist.length >= 3) { t.openPx = median(t.pxHist.slice(0, 3)); t.baseLocked = 1; }
+        save();
+      }
+      const base = t.cost > 0 ? t.cost : (t.baseLocked ? t.openPx : 0);
+      const x = base ? d.px / base : 0;
+      if (x > 0) t.peak = Math.max(t.peak || 0, x);
       const dec = Number(big(await call(t.addr, '0x313ce567')) || 18n);
       const value = (Number(bal) / 10 ** dec) * d.px; // 持仓市值（U）
       // 自动止盈：3 倍卖出回本+50% 利润；高点（≥2 倍）回落 40% 全卖，连续 2 次确认防假摔
       if (value >= 0.3 && now() >= (t.tpRetryAt || 0)) {
         if (!t.flags.tp3 && x >= OUR.tpX) {
-          const frac = t.cost > 0 ? Math.min(1, (1 + OUR.tpProfit) / x) : 0.5;
+          const frac = tpFrac(x, t.cost);
           const ok = await autoSellFrac(t, frac, `到 ${x.toFixed(1)} 倍，卖出回本+${Math.round(OUR.tpProfit * 100)}% 利润`);
           if (ok) { t.flags.tp3 = 1; save(); } else { t.tpRetryAt = now() + 300e3; save(); }
         } else if (t.peak >= 2 && x <= t.peak * (1 - OUR.tpCrash)) {
@@ -808,9 +862,11 @@ async function execSell(t, half) {
   const r = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', qty, '--fromToken', t.addr, '--toToken', NATIVE]);
   if (!r.j?.success) { await tg(`卖 ${t.sym} 失败：` + (r.j?.error?.message || r.t).slice(0, 120)); return; }
   await sleep(4000);
+  const balAfter = big(await call(t.addr, '0x70a08231' + wa(W.addr)));
+  if (bal - balAfter < (amt * 95n) / 100n) { await tg(`⚠️ 卖 ${t.sym}：baw 报成功，但链上代币余额没有减少（可能未成交），未登记卖出，请人工核对\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`); return; }
   const b1 = big(await rpc('eth_getBalance', [W.addr, 'latest']).catch(() => '0x'));
   const got = Number(b1 - b0) / 1e18;
-  await tg(`💰 已卖出 ${t.sym} ${qty}${half ? '（一半）' : ''}，换回约 ${got > 0 ? got.toFixed(5) : '?'} BNB\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`);
+  await tg(`💰 已卖出 ${t.sym} ${qty}${half ? '（一半）' : ''}，换回约 ${got > 0 ? got.toFixed(5) : '?'} BNB（链上余额已核对）\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`);
   if (!half) { S.hold = S.hold.filter((x) => !(x.addr === t.addr && x.only === t.only)); save(); }
 }
 async function autoSellFrac(t, frac, why) {
@@ -825,9 +881,11 @@ async function autoSellFrac(t, frac, why) {
   const r = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', qty, '--fromToken', t.addr, '--toToken', NATIVE]);
   if (!r.j?.success) { await tg(`自动止盈卖 ${t.sym} 失败（${why}）：` + (r.j?.error?.message || r.t).slice(0, 120) + '\n5 分钟后重试'); return false; }
   await sleep(4000);
+  const balAfter = big(await call(t.addr, '0x70a08231' + wa(W.addr)));
+  if (bal - balAfter < (amt * 95n) / 100n) { await tg(`⚠️ 自动止盈卖 ${t.sym}：baw 报成功，但链上代币余额没有减少，未登记卖出，稍后重试\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`); return false; }
   const b1 = big(await rpc('eth_getBalance', [W.addr, 'latest']).catch(() => '0x'));
   const got = Number(b1 - b0) / 1e18;
-  await tg(`💰 自动止盈：${t.sym} ${why}\n卖出 ${qty}，换回约 ${got > 0 ? got.toFixed(5) : '?'} BNB\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`);
+  await tg(`💰 自动止盈：${t.sym} ${why}\n卖出 ${qty}，换回约 ${got > 0 ? got.toFixed(5) : '?'} BNB（链上余额已核对）\n订单 ${r.j.data?.orderId || r.j.data?.txHash || ''}`);
   if (frac >= 1) { S.hold = S.hold.filter((x) => !(x.addr === t.addr && x.only === t.only)); save(); }
   return true;
 }
@@ -854,18 +912,54 @@ async function tickBlocks() {
     if (!S.lastBlock) { S.lastBlock = head; save(); return; }
     if (head > S.lastBlock) {
       const to = Math.min(head, S.lastBlock + 60);
-      await scanBlocks(S.lastBlock + 1, to);
+      const failed = await scanBlocks(S.lastBlock + 1, to);
       S.lastBlock = to;
+      if (failed.length) S.gaps = [...new Set([...(S.gaps || []), ...failed])].slice(-500);
       save();
     }
   } catch (e) { if (now() - (tickBlocks.lastLog || 0) > 30000) { tickBlocks.lastLog = now(); log('tickBlocks ' + e.message); } }
 }
-log(`启动：钱包 ${WALLETS.map((x) => x.name).join('/')}，付费上限 ${OUR.paidMaxUsd}U，审核门 ${OUR.audit ? '开' : '关'}，止盈 ${OUR.tpX} 倍/回落 ${Math.round(OUR.tpCrash * 100)}%，推送 ${TG ? 'TG' : '未配置'}`);
-tickBlocks();
-setInterval(tickBlocks, 1000);
-setInterval(() => { paidSweep().catch(() => {}); }, 60000);
-setInterval(() => { fastLane().catch(() => {}); }, 15000);
-setInterval(() => { holdWatch().catch(() => {}); }, 60000);
-setInterval(() => { tgPoll().catch(() => {}); }, 3000);
-setInterval(() => { loginCheck().catch(() => {}); }, 1800e3);
-setTimeout(() => { paidSweep().catch(() => {}); }, 8000);
+async function gapRetry() {
+  // 补扫之前失败的区块（取块/取回执失败记下的缺口），扫过一块删一块
+  if (!S.gaps?.length) return;
+  for (const b of S.gaps.slice(0, 20)) {
+    const failed = await scanBlocks(b, b).catch(() => [b]);
+    if (!failed.length) { S.gaps = S.gaps.filter((x) => x !== b); save(); }
+  }
+}
+function runSelfTest() {
+  const eq = (a, b, name) => { if (a !== b) { console.error(`SELFTEST FAIL ${name}: ${a} !== ${b}`); process.exitCode = 1; } else console.log('ok ' + name); };
+  const ok = (v, name) => eq(!!v, true, name);
+  const toxic = auditFlags('contract X { function kill() public { selfdestruct(payable(msg.sender)); } function setBlack(address a) external onlyOwner {} }');
+  ok(toxic.hard.length >= 2, 'audit toxic -> hard');
+  const benign = auditFlags('contract Y { function mint(uint n) external onlyOwner {} }');
+  eq(benign.hard.length, 0, 'audit owner-mint -> no hard');
+  ok(benign.soft.length >= 1, 'audit owner-mint -> soft');
+  eq(tpFrac(3, 10), 0.5, 'tpFrac 3x paid = 0.5');
+  eq(tpFrac(4, 10), 0.375, 'tpFrac 4x paid = 0.375');
+  eq(tpFrac(3, 0), 0.5, 'tpFrac free = 0.5');
+  eq(tpFrac(1.5, 10), 1, 'tpFrac caps at 1');
+  eq(median([1, 3, 2]), 2, 'median');
+  eq(median([0.5, 9, 0.7]), 0.7, 'median spike-resistant');
+  eq(parseState('not json'), null, 'parseState garbage -> null');
+  eq(parseState('{"a":1}').a, 1, 'parseState ok');
+  ok(/revert/i.test('execution reverted: quota'), 'revert detect');
+  eq(/revert/i.test('network timeout'), false, 'timeout is not revert');
+  eq(mintClosed({ done: { w: 'free' }, count: { w: 3 } }, { name: 'w' }), false, 'mintClosed free+3 open');
+  eq(mintClosed({ done: { w: 'free' }, count: { w: 10 } }, { name: 'w' }), true, 'mintClosed 10 closed');
+  eq(mintClosed({ done: { w: 'fail' }, count: { w: 1 } }, { name: 'w' }), true, 'mintClosed fail closed');
+  console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
+}
+if (SELFTEST) runSelfTest();
+else {
+  log(`启动：钱包 ${WALLETS.map((x) => x.name).join('/')}，付费上限 ${OUR.paidMaxUsd}U，审核门 ${OUR.audit ? '开' : '关'}，止盈 ${OUR.tpX} 倍/回落 ${Math.round(OUR.tpCrash * 100)}%，推送 ${TG ? 'TG' : '未配置'}`);
+  tickBlocks();
+  setInterval(tickBlocks, 1000);
+  setInterval(() => { gapRetry().catch(() => {}); }, 30000);
+  setInterval(() => { paidSweep().catch(() => {}); }, 60000);
+  setInterval(() => { fastLane().catch(() => {}); }, 15000);
+  setInterval(() => { holdWatch().catch(() => {}); }, 60000);
+  setInterval(() => { tgPoll().catch(() => {}); }, 3000);
+  setInterval(() => { loginCheck().catch(() => {}); }, 1800e3);
+  setTimeout(() => { paidSweep().catch(() => {}); }, 8000);
+}
