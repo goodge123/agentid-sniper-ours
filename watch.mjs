@@ -223,13 +223,16 @@ function qqBridge(text) {
   } catch {}
 }
 async function tg(text, toGroup = false) {
+  // 返回是否确认送达（TG 未配置或接口报错 = 未送达）；普通调用方不看返回值
   log('TG: ' + text.replace(/\n/g, ' | '));
   qqBridge(text);
-  if (!TG) return;
+  if (!TG) return false;
   const chat = toGroup && TG.group ? TG.group : TG.chat;
   try {
-    await fetch(`https://api.telegram.org/bot${TG.token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }), signal: AbortSignal.timeout(10000) });
-  } catch {}
+    const r = await fetch(`https://api.telegram.org/bot${TG.token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }), signal: AbortSignal.timeout(10000) });
+    const j = await r.json().catch(() => null);
+    return !!(r.ok && j?.ok);
+  } catch { return false; }
 }
 
 // ---------- 基础读数：名字、关联代币、进度、是否开池 ----------
@@ -544,9 +547,12 @@ const KNOWN_SEL = new Set(['1249c58b', '5b70ea9f', '4e71d92d', 'a0712d68', '2609
 const MECH_FAMS = [['质押', /stake|staking/i], ['销毁', /\bburn\b|burnable/i], ['联合曲线', /bonding|\bcurve\b/i], ['纪元/赛季', /epoch|season/i], ['任务', /quest/i], ['投票治理', /voting|\bvote\b|governor/i], ['复投/收割', /compound|harvest/i], ['借贷', /lending|\bborrow\b/i]];
 const mechFams = (src) => MECH_FAMS.filter(([, re]) => re.test(src)).map(([name]) => name);
 const innoCache = new Map();
+const innoTrig = (r) => !!r && r.hard >= 1 && r.score >= 3; // 触发门槛：≥1 项实质证据（机制词/多交互/双资产）且总分 ≥3，结构类只作辅助
+const learnedSelN = (c) => new Set((S.learned?.[c] || []).map((d) => d.slice(0, 10).toLowerCase())).size;
 async function innovation(c, P) {
-  if (innoCache.has(c)) return innoCache.get(c);
-  let score = 0;
+  const ent = innoCache.get(c);
+  if (ent && now() - ent.at < 1800e3 && ent.res.learnedN === learnedSelN(c)) return ent.res;
+  let score = 0, hard = 0;
   const hits = [];
   try {
     const src = await sourcifySrc(await logicAddr(c));
@@ -561,30 +567,40 @@ async function innovation(c, P) {
       const novel = [...sels].filter((s) => !KNOWN_SEL.has(s));
       if (novel.length >= 3) { score++; hits.push(`有 ${novel.length} 个非常规函数（自有机制）`); }
       const fams = mechFams(src);
-      if (fams.length >= 2) { score++; hits.push('含专有机制：' + fams.join('/')); }
+      if (fams.length >= 2) { score++; hard++; hits.push('含专有机制：' + fams.join('/')); }
     }
-    if (P?.dualAsset) { score++; hits.push('铸造同时产出代币与 NFT'); }
+    if (P?.dualAsset) { score++; hard++; hits.push('铸造同时产出代币与 NFT'); }
     try {
       const tk = await tokenOf(c).catch(() => c);
       const impl = await logicAddr(c).catch(() => c);
       const pieces = 1 + (LC(tk) !== LC(c) ? 1 : 0) + (impl && impl !== LC(c) ? 1 : 0);
       if (pieces >= 3) { score++; hits.push('成套架构（代理+独立代币+铸造合约）'); }
     } catch {}
-    const learnedSels = new Set((S.learned?.[c] || []).map((d) => d.slice(0, 10).toLowerCase()));
-    if (learnedSels.size >= 2) { score++; hits.push('Agent ID 钱包有多种交互方式（不止铸造）'); }
+    if (learnedSelN(c) >= 2) { score++; hard++; hits.push('Agent ID 钱包有多种交互方式（不止铸造）'); }
     if (await hasRefund(c)) { score++; hits.push('带退款保本机制'); }
   } catch {}
-  const res = { score, hits };
-  innoCache.set(c, res);
-  if (P && score >= 2) { P.innovative = score; save(); }
+  const res = { score, hard, hits, learnedN: learnedSelN(c) };
+  innoCache.set(c, { res, at: now() });
+  if (P) {
+    if (innoTrig(res)) { if (P.innovative !== res.score) { P.innovative = res.score; save(); } }
+    else if (P.innovative) { delete P.innovative; save(); }
+  }
   return res;
 }
-async function innoAlert(c, P) {
-  const inno = await innovation(c, P).catch(() => ({ score: 0, hits: [] }));
-  if (inno.score >= 2 && !P.innoNoted) {
-    P.innoNoted = 1; save();
-    await tg(`⭐ 重点提醒·创新候选：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\nTG 发「创新」可看全部圈出的创新项目`);
-  }
+async function innoAlert(c, P, extra = '') {
+  const inno = await innovation(c, P).catch(() => ({ score: 0, hard: 0, hits: [] }));
+  if (P.innoScore !== inno.score || P.innoHard !== inno.hard) { P.innoScore = inno.score; P.innoHard = inno.hard; save(); }
+  if (!innoTrig(inno)) return inno;
+  let kind = '';
+  if (!P.innoStage) kind = '首次发现';
+  else if (P.innoStage === 1 && (inno.hard > (P.innoAlertHard || 0) || inno.score >= (P.innoAlertScore || 0) + 2)) kind = '新证据进展';
+  if (!kind) return inno;
+  if ((P.innoTries || 0) >= 5 || now() < (P.innoTryAt || 0)) return inno;
+  const delivered = await tg(`⭐ 重点提醒·创新候选（${kind}）：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\n证据：实质 ${inno.hard} 项，总分 ${inno.score}${extra}\nTG 发「创新」可看全部圈出的创新项目`);
+  P.innoTries = (P.innoTries || 0) + 1;
+  if (delivered) { P.innoStage = kind === '首次发现' ? 1 : 2; P.innoAlertScore = inno.score; P.innoAlertHard = inno.hard; P.innoTries = 0; P.innoTryAt = 0; }
+  else P.innoTryAt = now() + 1800e3; // 未送达：30 分钟后补发，最多 5 次
+  save();
   return inno;
 }
 
@@ -701,7 +717,7 @@ async function autoMint(c, found, W) {
   }
   if (serialN >= 3) note += `\n（部署者已发 ${serialN} 个项目）`;
   const inno = await innoAlert(c, P);
-  if (inno.score >= 2) note += '\n（⭐ 创新候选：' + inno.hits.join('、') + '）';
+  if (innoTrig(inno)) note += '\n（⭐ 创新候选：' + inno.hits.join('、') + '）';
   // 每日上限与 gas 余额
   const tk2 = todayKey();
   S.mintCnt = S.mintCnt || {};
@@ -804,12 +820,12 @@ async function analyzePaid(c, P) {
 类型：${{ bnb: 'BNB 报价型', usdt: 'USDT 份额型', gen: 'NFT 单价型' }[kind] || kind}
 单价：${unitTxt}${costTxt ? `\n成本：${costTxt}` : ''}
 参与：Agent ID 钱包约 ${agents} 个${eff !== agents ? `（同块批量打折后有效约 ${eff} 个）` : ''}${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
-创新：${inno.score >= 2 ? '⭐ 有创新点' : '一般'}${inno.hits.length ? '（' + inno.hits.join('、') + '）' : ''}
+创新：${innoTrig(inno) ? '⭐ 有创新点' : '一般'}（实质 ${inno.hard || 0} 项，总分 ${inno.score}）${inno.hits.length ? '（' + inno.hits.join('、') + '）' : ''}
 保本：合约有退款函数 ✓${pool ? '\n状态：已开池' : ''}${rn}
 合约审核：${au.verdict === 'clean' ? '源码已验证、未见红旗' : au.verdict === 'flag' ? '源码已验证但有红旗：' + au.hard.join('、') : au.verdict === 'soft' ? '源码已验证，审核提示：' + au.soft.join('、') : '源码未验证'}
 结论：${verdict}——${reason}
 要打回主聊天告诉我打哪个、多少份，我先预览报总成本和每份到账，你确认了才执行；不回就不打`);
-  if (inno.score >= 2 && !P.innoNoted) { P.innoNoted = 1; save(); await tg(`⭐ 重点提醒·创新候选：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\n付费结论：${verdict}——${reason}\nTG 发「创新」可看全部圈出的创新项目`); }
+  if (innoTrig(inno)) await innoAlert(c, P, `\n付费结论：${verdict}——${reason}`);
 }
 async function paidSweep() {
   for (const [c, P] of Object.entries(S.track)) {
@@ -860,6 +876,16 @@ async function fastLane() {
           if (ff) queueMint(c, ff, W);
         }
       }
+    } catch {}
+  }
+}
+
+async function innoSweep() {
+  // 创新评估挂全项目巡检：不依赖收费分析/铸造流程，无退款、未到门槛的项目同样评
+  for (const [c, P] of Object.entries(S.track)) {
+    try {
+      if (now() - (P.at || 0) > 3 * 86400e3) continue;
+      await innoAlert(c, P);
     } catch {}
   }
 }
@@ -1111,6 +1137,10 @@ function runSelfTest() {
   ok(KNOWN_SEL.has(sigSel('mint()')), 'mint() is a known selector');
   eq(mechFams('function stake(uint n) public {} function burn(uint n) public {}').length, 2, 'mechFams two families');
   eq(mechFams('function mint() public {}').length, 0, 'mechFams plain template none');
+  eq(innoTrig({ hard: 0, score: 5 }), false, 'innoTrig no-hard blocked');
+  eq(innoTrig({ hard: 1, score: 2 }), false, 'innoTrig low-score blocked');
+  eq(innoTrig({ hard: 1, score: 3 }), true, 'innoTrig hard+3 passes');
+  eq(innoTrig({ hard: 2, score: 3 }), true, 'innoTrig 2hard+3 passes');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
@@ -1120,9 +1150,11 @@ else {
   setInterval(tickBlocks, 1000);
   setInterval(() => { gapRetry().catch(() => {}); }, 30000);
   setInterval(() => { paidSweep().catch(() => {}); }, 60000);
+  setInterval(() => { innoSweep().catch(() => {}); }, 60000);
   setInterval(() => { fastLane().catch(() => {}); }, 15000);
   setInterval(() => { holdWatch().catch(() => {}); }, 60000);
   setInterval(() => { tgPoll().catch(() => {}); }, 3000);
   setInterval(() => { loginCheck().catch(() => {}); }, 1800e3);
   setTimeout(() => { paidSweep().catch(() => {}); }, 8000);
+  setTimeout(() => { innoSweep().catch(() => {}); }, 20000);
 }
