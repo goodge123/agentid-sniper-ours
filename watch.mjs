@@ -99,7 +99,7 @@ if (!SELFTEST) try {
   writeFileSync(LOCK_FILE, String(process.pid));
 } catch {}
 
-// ---------- RPC：专属节点优先（按估算 CU 用量，单 key 到 90% 自动切换下一个），全用完/全失败回落公共节点；坏节点短暂冷却 ----------
+// ---------- RPC：公共节点优先，限流/全失败时切专属节点顶上，公共恢复自动切回（用户 16:20 口径）；专属按估算 CU 用量，单 key 到 90% 自动换下一个；坏节点短暂冷却 ----------
 const PUBLIC_RPCS = [
   'https://bsc-dataseed.bnbchain.org',
   'https://bsc-rpc.publicnode.com',
@@ -115,7 +115,7 @@ try { rpcUse = JSON.parse(readFileSync(RPC_USAGE_FILE, 'utf8')); } catch {}
 let rpcCallsSinceSave = 0;
 function saveRpcUse() { try { writeFileSync(RPC_USAGE_FILE, JSON.stringify(rpcUse)); } catch {} }
 const rpcExhausted = (u) => (rpcUse[u] || 0) >= CU_CAP;
-const rpcPool = () => { const act = PAID_RPCS.filter((u) => !rpcExhausted(u)); return act.length ? act : PUBLIC_RPCS; };
+const rpcPools = () => { const paid = PAID_RPCS.filter((u) => !rpcExhausted(u)); return paid.length ? [PUBLIC_RPCS, paid] : [PUBLIC_RPCS]; }; // 公共在前，专属只作限流时的备用池
 function addRpcUse(u, method) {
   if (!PAID_RPCS.includes(u)) return;
   const before = rpcUse[u] || 0;
@@ -123,16 +123,17 @@ function addRpcUse(u, method) {
   if (before < CU_CAP && rpcUse[u] >= CU_CAP) { saveRpcUse(); log(`专属 RPC 第 ${PAID_RPCS.indexOf(u) + 1} 个 key 估算用量已达 90%（约 ${Math.round(rpcUse[u] / 10000)} 万 CU），自动切换下一个`); }
   else if (++rpcCallsSinceSave >= 100) { rpcCallsSinceSave = 0; saveRpcUse(); }
 }
-if (PAID_RPCS.length) log(`RPC：专属节点 ${PAID_RPCS.length} 个（单 key 估算到 90% 自动切换，全用完回落公共节点）`);
+if (PAID_RPCS.length) log(`RPC：公共节点优先，限流时切专属节点 ${PAID_RPCS.length} 个顶上（单 key 估算到 90% 自动换下一个，公共恢复自动切回）`);
 let riUrl = '';
 const rpcBad = new Map();
 const rpcFailN = new Map();
-async function tryPool(pool, method, params) {
+async function tryPool(pool, method, params, forceOne = true) {
   let last = null;
   const start = Math.max(0, pool.indexOf(riUrl));
   const order = pool.map((_, i) => pool[(start + i) % pool.length]);
   const avail = order.filter((u) => (rpcBad.get(u) || 0) <= now());
-  // 全在冷却时也至少试最早解禁的一个，绝不整批放弃（否则一波限流就永久假死）
+  if (!avail.length && !forceOne) throw new Error('pool cooling'); // 后面还有备用池时，不硬敲全在冷却（限流中）的池，直接换池
+  // 最后一个池全在冷却时也至少试最早解禁的一个，绝不整批放弃（否则一波限流就永久假死）
   const tryList = avail.length ? avail : [order.reduce((a, b) => ((rpcBad.get(a) || 0) <= (rpcBad.get(b) || 0) ? a : b))];
   for (const u of tryList) {
     try {
@@ -152,9 +153,13 @@ async function tryPool(pool, method, params) {
   throw last || new Error('all rpc down');
 }
 async function rpc(method, params) {
-  const pool = rpcPool();
-  try { return await tryPool(pool, method, params); }
-  catch (e) { if (pool !== PUBLIC_RPCS) return await tryPool(PUBLIC_RPCS, method, params); throw e; }
+  const pools = rpcPools();
+  let last = null;
+  for (let i = 0; i < pools.length; i++) {
+    try { return await tryPool(pools[i], method, params, i === pools.length - 1); }
+    catch (e) { last = e; } // 公共池限流/失败 → 下一个池（专属）顶上；下次调用又从公共池开始，恢复即切回
+  }
+  throw last || new Error('all rpc down');
 }
 const call = (to, data) => rpc('eth_call', [{ to, data }, 'latest']).catch(() => null);
 const big = (h) => (h && h !== '0x' && h.length >= 66 ? BigInt(h.slice(0, 66)) : 0n);
@@ -1514,6 +1519,7 @@ function runSelfTest() {
   eq(cuWeight('eth_getLogs'), 75, 'cuWeight eth_getLogs');
   eq(cuWeight('eth_somethingElse'), 20, 'cuWeight default');
   ok(CU_CAP === 9_000_000 && !rpcExhausted('https://example.invalid/nope'), 'rpc CU cap 90% of 10M');
+  ok(rpcPools()[0] === PUBLIC_RPCS, 'rpc pools public first');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
