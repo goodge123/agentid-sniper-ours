@@ -4,6 +4,7 @@
 // 持仓自动止盈：3 倍卖出回本+50% 利润，从高点回落 40% 全卖（用户 2026-11-01 定）。
 // 执行统一走币安 Agentic Wallet（baw），本程序不碰私钥。
 import { execFile } from 'node:child_process';
+import { request as httpsRequest } from 'node:https';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,17 +231,30 @@ function qqBridge(text) {
     execFile('bash', [script, f], { timeout: 30000 }, () => {});
   } catch {}
 }
+function tgApi(method, payload, timeoutMs = 10000) {
+  // Telegram 专用请求：强制 IPv4（服务器上 Node fetch 走 IPv6 会超时，curl/https 不受影响）
+  return new Promise((resolve) => {
+    if (!TG) return resolve(null);
+    const body = JSON.stringify(payload || {});
+    const req = httpsRequest(`https://api.telegram.org/bot${TG.token}/${method}`, { method: 'POST', family: 4, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }, timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (d) => { data += d; });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
 async function tg(text, toGroup = false) {
   // 返回是否确认送达（TG 未配置或接口报错 = 未送达）；普通调用方不看返回值
   log('TG: ' + text.replace(/\n/g, ' | '));
   qqBridge(text);
   if (!TG) return false;
   const chat = toGroup && TG.group ? TG.group : TG.chat;
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG.token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }), signal: AbortSignal.timeout(10000) });
-    const j = await r.json().catch(() => null);
-    return !!(r.ok && j?.ok);
-  } catch { return false; }
+  const j = await tgApi('sendMessage', { chat_id: chat, text, disable_web_page_preview: true });
+  return !!(j && j.ok);
 }
 
 // ---------- 基础读数：名字、关联代币、进度、是否开池 ----------
@@ -1160,8 +1174,8 @@ async function holdWatch() {
 async function tgPoll() {
   if (!TG) return;
   try {
-    const j = await (await fetch(`https://api.telegram.org/bot${TG.token}/getUpdates?timeout=0&offset=${S.tgOffset || 0}`, { signal: AbortSignal.timeout(8000) })).json();
-    for (const u of j.result || []) {
+    const j = await tgApi('getUpdates', { timeout: 0, offset: S.tgOffset || 0 }, 8000);
+    for (const u of j?.result || []) {
       S.tgOffset = u.update_id + 1;
       const m = u.message;
       if (!m?.text || String(m.chat?.id) !== String(TG.chat)) continue;
