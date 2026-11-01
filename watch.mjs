@@ -62,7 +62,7 @@ if (!S) {
   if (Object.keys(S).length) console.error('state.json 损坏，已从 state.json.bak 恢复');
 }
 S.track = S.track || {};       // 追踪中的合约： addr -> {name, at, agents, progress, done:{wallet:status}, kind, ...}
-for (const P of Object.values(S.track)) if (P.links && P.links.v !== 2) delete P.links; // 一次性清理旧版提取的垃圾链接（库文件参考链接冒充官网）
+for (const P of Object.values(S.track)) if (P.links && P.links.v !== 3) delete P.links; // 一次性清理旧版提取的垃圾链接（库文件参考链接冒充官网）
 S.hold = S.hold || [];         // 持仓： {sym, addr, cost(USD), only, openPx, flags:{}}
 S.black = S.black || {};       // 部署者黑名单： addr -> {why, at}
 S.mintCnt = S.mintCnt || {};   // 每日免费打计数
@@ -972,14 +972,25 @@ async function paidSweep() {
       if (!gate) continue;
       if (!P.refundOk) {
         if (!P.noRefundLog) {
-          P.noRefundLog = 1; setVerdict(P, '拒绝', '付费项目无退款（保本）机制'); save();
-          await tg(`🔔 付费项目分析：${P.name || c.slice(0, 10)}（进度 ${fp != null ? Math.round(fp * 100) + '%' : '读不到'}）\n合约：${c}\n结论：不打——付费项目但合约没有退款（保本）机制\n要破例打，回主聊天告诉我，我先预览报数你再确认`);
+          // 无退款不打：不逐个推送（量太大、没信息量），只记名单进 6 小时汇总；裁决照常记录可查
+          P.noRefundLog = 1; setVerdict(P, '拒绝', '付费项目无退款（保本）机制');
+          S.noRefList = S.noRefList || [];
+          S.noRefList.push({ c, name: P.name || '', fp, agents: P.agents || 0, at: now() });
+          if (S.noRefList.length > 500) S.noRefList = S.noRefList.slice(-500);
+          save();
         }
         continue;
       }
       if (!P.reported) { P.reported = 1; save(); await analyzePaid(c, P).catch((e) => log('analyzePaid ' + e.message)); }
     } catch (e) { log(`paidSweep ${c} ${e.message}`); }
   }
+}
+async function noRefDigest() {
+  const fresh = (S.noRefList || []).filter((x) => x.at > (S.noRefDigestAt || 0));
+  if (!fresh.length) return;
+  S.noRefDigestAt = now(); save();
+  const lines = fresh.slice(0, 60).map((x) => `✖ ${x.name || x.c.slice(0, 10)}｜进度 ${x.fp != null ? Math.round(x.fp * 100) + '%' : '—'}｜参与 ${x.agents}｜${x.c}`);
+  await tg(`🔕 无退款不打汇总（共 ${fresh.length} 个，只记名单不逐个推；其中创新/叙事达标的仍会单独提醒，发「项目」可查全部裁决）\n` + lines.join('\n') + (fresh.length > 60 ? `\n……还有 ${fresh.length - 60} 个未列` : ''));
 }
 async function fastLane() {
   // 临近门槛的追踪项加快检查（15 秒一轮）：进度跨过门槛就立刻排队打
@@ -1023,8 +1034,9 @@ function extractUrls(text) {
   for (const u of urls) {
     const s = u.replace(/[.,;]+$/, '');
     if (URL_DENY.test(s)) continue;
-    if (!out.x && /(twitter\.com|x\.com)\//i.test(s) && !/(intent|share|home)/i.test(s)) out.x = s;
-    else if (!out.github && /github\.com\/[\w.-]+\/[\w.-]+/i.test(s)) out.github = s;
+    const gm = !out.github ? s.match(/^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/?$/i) : null;
+    if (!out.x && /^https?:\/\/(twitter\.com|x\.com)\/[\w]+\/?$/i.test(s)) out.x = s; // 只认账号主页，不认单条推文链接
+    else if (gm && !/^(base64|solidity|forge-std|openzeppelin-contracts|solmate|solady|contracts|hardhat|foundry)$/i.test(gm[2])) out.github = s.replace(/\/$/, ''); // 只认仓库根目录，库文件 blob 链接是代码引用不是项目仓库
     else if (!out.site && !/(twitter\.com|x\.com|github\.com|t\.me|discord|bscscan|dexscreener|pancakeswap|four\.meme|flap\.sh|ipfs)/i.test(s)) out.site = s;
   }
   return out;
@@ -1033,9 +1045,9 @@ const xHandle = (url) => (String(url).match(/(?:twitter\.com|x\.com)\/([\w]+)/i)
 async function discoverLinks(c, P) {
   const ent = linkCache.get(c);
   if (ent && now() - ent.at < 6 * 3600e3) return ent.links;
-  let links = P.links?.v === 2 ? { ...P.links } : { site: '', x: '', github: '', src: '', v: 2 };
+  let links = P.links?.v === 3 ? { ...P.links } : { site: '', x: '', github: '', src: '', v: 3 };
   if (!links.site && !links.x) {
-    try { const u = extractUrls(await sourcifyMainSrc(await logicAddr(c))); if (u.site || u.x || u.github) links = { ...u, src: '源码', v: 2 }; } catch {}
+    try { const u = extractUrls(await sourcifyMainSrc(await logicAddr(c))); if (u.site || u.x || u.github) links = { ...u, src: '源码', v: 3 }; } catch {}
   }
   if (!links.site || !links.x) {
     try {
@@ -1046,7 +1058,7 @@ async function discoverLinks(c, P) {
       if (info) {
         const soc = {};
         for (const s of info.socials || []) soc[s.type] = s.url;
-        links = { site: links.site || info.websites?.[0]?.url || '', x: links.x || soc.twitter || '', github: links.github || soc.github || '', src: links.src ? links.src + '+Dex' : 'Dex', v: 2 };
+        links = { site: links.site || info.websites?.[0]?.url || '', x: links.x || soc.twitter || '', github: links.github || soc.github || '', src: links.src ? links.src + '+Dex' : 'Dex', v: 3 };
       }
     } catch {}
   }
@@ -1057,7 +1069,7 @@ async function discoverLinks(c, P) {
     if (got && ((nm.length >= 3 && got.html.includes(nm)) || got.html.includes(c.slice(2, 20)))) links.siteOk = 1;
     else links.site = '';
   }
-  const stale = !!(P.links && P.links.v !== 2); // 旧版提取的链接（含库文件垃圾链接）一律覆盖作废
+  const stale = !!(P.links && P.links.v !== 3); // 旧版提取的链接（含库文件垃圾链接）一律覆盖作废
   if (stale || ((links.site || links.x || links.github) && JSON.stringify(links) !== JSON.stringify(P.links || {}))) { P.links = links; save(); }
   linkCache.set(c, { links, at: now() });
   return links;
@@ -1436,6 +1448,9 @@ function runSelfTest() {
   eq(lu2.site, 'https://agentlings.fun/', 'extractUrls denies eip/solidity links');
   eq(lu2.github, '', 'extractUrls denies ethereum github');
   eq(lu2.x, 'https://x.com/agentlings', 'extractUrls keeps real x');
+  const lu3 = extractUrls('lib https://github.com/Brechtpd/base64/blob/e78/base64.sol and repo https://github.com/agentlings/protocol and post https://x.com/agentlings/status/12345');
+  eq(lu3.github, 'https://github.com/agentlings/protocol', 'extractUrls github repo root only');
+  eq(lu3.x, '', 'extractUrls x status link rejected');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
@@ -1447,6 +1462,7 @@ else {
   setInterval(() => { paidSweep().catch(() => {}); }, 60000);
   setInterval(() => { innoSweep().catch(() => {}); }, 60000);
   setInterval(() => { narrativeSweep().catch(() => {}); }, 300000);
+  setInterval(() => { noRefDigest().catch(() => {}); }, 6 * 3600e3);
   setInterval(() => { fastLane().catch(() => {}); }, 15000);
   setInterval(() => { holdWatch().catch(() => {}); }, 60000);
   setInterval(() => { tgPoll().catch(() => {}); }, 3000);
