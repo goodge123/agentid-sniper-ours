@@ -62,6 +62,7 @@ if (!S) {
   if (Object.keys(S).length) console.error('state.json 损坏，已从 state.json.bak 恢复');
 }
 S.track = S.track || {};       // 追踪中的合约： addr -> {name, at, agents, progress, done:{wallet:status}, kind, ...}
+for (const P of Object.values(S.track)) if (P.links && P.links.v !== 2) delete P.links; // 一次性清理旧版提取的垃圾链接（库文件参考链接冒充官网）
 S.hold = S.hold || [];         // 持仓： {sym, addr, cost(USD), only, openPx, flags:{}}
 S.black = S.black || {};       // 部署者黑名单： addr -> {why, at}
 S.mintCnt = S.mintCnt || {};   // 每日免费打计数
@@ -467,6 +468,19 @@ async function sourcifySrc(addr) {
     return Object.values(src).map((f) => (f && f.content) || '').join('\n').slice(0, 2000000);
   } catch { return null; }
 }
+async function sourcifyMainSrc(addr) {
+  // 只取项目主合约文件（剔除 OpenZeppelin 等库文件——库里的参考链接不是项目官网）
+  try {
+    const r = await fetch('https://sourcify.dev/server/v2/contract/56/' + addr + '?fields=sources', { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const src = j && j.sources;
+    if (!src || !Object.keys(src).length) return null;
+    const paths = Object.keys(src);
+    const main = paths.filter((p) => !/(openzeppelin|@openzeppelin|\/lib\/|node_modules|libsol|forge-std|hardhat|@chainlink|@ensdomains)/i.test(p));
+    return (main.length ? main : paths).map((p) => src[p]?.content || '').join('\n').slice(0, 500000);
+  } catch { return null; }
+}
 function auditFlags(src) {
   const hard = [], soft = [];
   if (src.includes('selfdestruct') || src.includes('suicide(')) hard.push('含 selfdestruct');
@@ -642,7 +656,13 @@ async function innovation(c, P) {
   }
   return res;
 }
+const innoSending = new Set();
 async function innoAlert(c, P, extra = '', withInfo = true) {
+  if (innoSending.has(c)) return { score: 0, score100: P.inno100 || 0, grade: P.innoGrade || 'C', hard: 0, hits: [] }; // 在途锁：防巡检与分析并发同发两遍
+  innoSending.add(c);
+  try { return await innoAlertInner(c, P, extra, withInfo); } finally { innoSending.delete(c); }
+}
+async function innoAlertInner(c, P, extra = '', withInfo = true) {
   const inno = await innovation(c, P).catch(() => null);
   if (!inno) return { score: 0, score100: 0, grade: 'C', hard: 0, hits: [] };
   // 成长记录：分数变化 ≥5 或等级变化留一条（最多 10 条）
@@ -995,12 +1015,14 @@ async function innoSweep() {
 const NARR = () => (CONFIG.narrative?.apiKey ? CONFIG.narrative : null);
 const narrGradeOf = (t) => (t >= 70 ? 'A' : t >= 45 ? 'B' : 'C');
 const linkCache = new Map();
+const URL_DENY = /(eips\.ethereum\.org|ethereum\.org|soliditylang\.org|openzeppelin\.com|wikipedia\.org|readthedocs|github\.com\/(ethereum|OpenZeppelin|foundry-rs|smartcontractkit)\b|gnu\.org|apache\.org\/licenses|creativecommons)/i;
 function extractUrls(text) {
   const out = { site: '', x: '', github: '' };
   if (!text) return out;
-  const urls = text.match(/https?:\/\/[^\s"'<>\\)]+/g) || [];
+  const urls = text.match(/https?:\/\/[^\s"'<>\(\)\[\]]+/g) || [];
   for (const u of urls) {
     const s = u.replace(/[.,;]+$/, '');
+    if (URL_DENY.test(s)) continue;
     if (!out.x && /(twitter\.com|x\.com)\//i.test(s) && !/(intent|share|home)/i.test(s)) out.x = s;
     else if (!out.github && /github\.com\/[\w.-]+\/[\w.-]+/i.test(s)) out.github = s;
     else if (!out.site && !/(twitter\.com|x\.com|github\.com|t\.me|discord|bscscan|dexscreener|pancakeswap|four\.meme|flap\.sh|ipfs)/i.test(s)) out.site = s;
@@ -1011,9 +1033,9 @@ const xHandle = (url) => (String(url).match(/(?:twitter\.com|x\.com)\/([\w]+)/i)
 async function discoverLinks(c, P) {
   const ent = linkCache.get(c);
   if (ent && now() - ent.at < 6 * 3600e3) return ent.links;
-  let links = P.links || { site: '', x: '', github: '', src: '' };
+  let links = P.links?.v === 2 ? { ...P.links } : { site: '', x: '', github: '', src: '', v: 2 };
   if (!links.site && !links.x) {
-    try { const u = extractUrls(await sourcifySrc(await logicAddr(c))); if (u.site || u.x || u.github) links = { ...u, src: '源码' }; } catch {}
+    try { const u = extractUrls(await sourcifyMainSrc(await logicAddr(c))); if (u.site || u.x || u.github) links = { ...u, src: '源码', v: 2 }; } catch {}
   }
   if (!links.site || !links.x) {
     try {
@@ -1024,11 +1046,19 @@ async function discoverLinks(c, P) {
       if (info) {
         const soc = {};
         for (const s of info.socials || []) soc[s.type] = s.url;
-        links = { site: links.site || info.websites?.[0]?.url || '', x: links.x || soc.twitter || '', github: links.github || soc.github || '', src: links.src ? links.src + '+Dex' : 'Dex' };
+        links = { site: links.site || info.websites?.[0]?.url || '', x: links.x || soc.twitter || '', github: links.github || soc.github || '', src: links.src ? links.src + '+Dex' : 'Dex', v: 2 };
       }
     } catch {}
   }
-  if ((links.site || links.x || links.github) && JSON.stringify(links) !== JSON.stringify(P.links || {})) { P.links = links; save(); }
+  // 官网归属验证：从源码提取的官网必须能抓开且页面里有项目名或合约地址，否则作废（防库文件链接冒充官网）
+  if (links.site && (links.src || '').includes('源码') && !links.siteOk) {
+    const got = await fetchSiteText(links.site).catch(() => null);
+    const nm = (P.name || '').toLowerCase();
+    if (got && ((nm.length >= 3 && got.html.includes(nm)) || got.html.includes(c.slice(2, 20)))) links.siteOk = 1;
+    else links.site = '';
+  }
+  const stale = !!(P.links && P.links.v !== 2); // 旧版提取的链接（含库文件垃圾链接）一律覆盖作废
+  if (stale || ((links.site || links.x || links.github) && JSON.stringify(links) !== JSON.stringify(P.links || {}))) { P.links = links; save(); }
   linkCache.set(c, { links, at: now() });
   return links;
 }
@@ -1070,7 +1100,13 @@ async function narrativeAlert(c, P, links) {
   else P.narrTryAt = now() + 1800e3;
   save();
 }
+const narrSending = new Set();
 async function narrativeEval(c, P) {
+  if (narrSending.has(c)) return;
+  narrSending.add(c);
+  try { await narrativeEvalInner(c, P); } finally { narrSending.delete(c); }
+}
+async function narrativeEvalInner(c, P) {
   if (!NARR()) return;
   if (P.narrAt && now() - P.narrAt < 6 * 3600e3) return;
   const links = await discoverLinks(c, P).catch(() => null);
@@ -1396,6 +1432,10 @@ function runSelfTest() {
   eq(tc['Agent协作'].proven, 1, 'tagCounts proven=1');
   const sgP = { agents: 10, growth: [{ at: Date.now() - 1800e3, n: 4 }, { at: Date.now() - 300e3, n: 9 }] };
   eq(surgeText(sgP), '近 30 分钟 +6 个（现 10 个）', 'surgeText 30min delta');
+  const lu2 = extractUrls('ref https://eips.ethereum.org/EIPS/eip-6093 and https://github.com/ethereum/solidity/blob/x and real https://agentlings.fun/ x https://x.com/agentlings');
+  eq(lu2.site, 'https://agentlings.fun/', 'extractUrls denies eip/solidity links');
+  eq(lu2.github, '', 'extractUrls denies ethereum github');
+  eq(lu2.x, 'https://x.com/agentlings', 'extractUrls keeps real x');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
