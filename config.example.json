@@ -1,1 +1,1 @@
-{"paid":{"maxBnbPerDay":0.1,"maxUsd":10},"qqPushScript":"","rpcs":[],"telegram":{"botToken":"","chatId":"","groupChatId":""},"timeZone":"Asia/Shanghai","wallets":[{"address":"0x你的钱包地址","name":"你的 Agent ID 名字"}]}
+{"narrative":{"apiKey":"","baseUrl":"https://api.siliconflow.cn/v1","model":"Qwen/Qwen2.5-7B-Instruct"},"paid":{"maxBnbPerDay":0.1,"maxUsd":10},"qqPushScript":"","rpcs":[],"telegram":{"botToken":"","chatId":"","groupChatId":""},"timeZone":"Asia/Shanghai","wallets":[{"address":"0x你的钱包地址","name":"你的 Agent ID 名字"}]}

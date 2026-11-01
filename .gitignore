@@ -1,4 +1,5 @@
 config.json
+narrative.env
 data/
 node_modules/
 

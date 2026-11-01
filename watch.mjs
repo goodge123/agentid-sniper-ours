@@ -13,6 +13,14 @@ const SELFTEST = process.argv.includes('--selftest');
 let CONFIG;
 try { CONFIG = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8')); }
 catch (e) { if (!SELFTEST) throw e; CONFIG = { wallets: [], paid: {}, timeZone: 'Asia/Shanghai' }; }
+// 叙事 AI 配置可单独放 narrative.env（AI_API_KEY/AI_BASE_URL/AI_MODEL），部署覆盖 config.json 时不丢
+try {
+  if (!CONFIG.narrative?.apiKey && existsSync(join(DIR, 'narrative.env'))) {
+    const kv = {};
+    for (const line of readFileSync(join(DIR, 'narrative.env'), 'utf8').split('\n')) { const i = line.indexOf('='); if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim(); }
+    if (kv.AI_API_KEY) CONFIG.narrative = { apiKey: kv.AI_API_KEY, baseUrl: kv.AI_BASE_URL || 'https://api.siliconflow.cn/v1', model: kv.AI_MODEL || 'Qwen/Qwen2.5-7B-Instruct' };
+  }
+} catch {}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 const LC = (a) => String(a || '').toLowerCase();
@@ -931,6 +939,129 @@ async function innoSweep() {
   }
 }
 
+// ---------- 叙事轨：链接发现 -> 官网抓取 -> AI 五维评分 -> 分级提醒（与技术轨、铸造完全独立） ----------
+const NARR = () => (CONFIG.narrative?.apiKey ? CONFIG.narrative : null);
+const narrGradeOf = (t) => (t >= 70 ? 'A' : t >= 45 ? 'B' : 'C');
+const linkCache = new Map();
+function extractUrls(text) {
+  const out = { site: '', x: '', github: '' };
+  if (!text) return out;
+  const urls = text.match(/https?:\/\/[^\s"'<>\\)]+/g) || [];
+  for (const u of urls) {
+    const s = u.replace(/[.,;]+$/, '');
+    if (!out.x && /(twitter\.com|x\.com)\//i.test(s) && !/(intent|share|home)/i.test(s)) out.x = s;
+    else if (!out.github && /github\.com\/[\w.-]+\/[\w.-]+/i.test(s)) out.github = s;
+    else if (!out.site && !/(twitter\.com|x\.com|github\.com|t\.me|discord|bscscan|dexscreener|pancakeswap|four\.meme|flap\.sh|ipfs)/i.test(s)) out.site = s;
+  }
+  return out;
+}
+const xHandle = (url) => (String(url).match(/(?:twitter\.com|x\.com)\/([\w]+)/i)?.[1] || '').toLowerCase();
+async function discoverLinks(c, P) {
+  const ent = linkCache.get(c);
+  if (ent && now() - ent.at < 6 * 3600e3) return ent.links;
+  let links = P.links || { site: '', x: '', github: '', src: '' };
+  if (!links.site && !links.x) {
+    try { const u = extractUrls(await sourcifySrc(await logicAddr(c))); if (u.site || u.x || u.github) links = { ...u, src: '源码' }; } catch {}
+  }
+  if (!links.site || !links.x) {
+    try {
+      const tk = await tokenOf(c).catch(() => c);
+      const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tk}`, { signal: AbortSignal.timeout(10000) });
+      const j = await r.json().catch(() => null);
+      const info = j?.pairs?.[0]?.info;
+      if (info) {
+        const soc = {};
+        for (const s of info.socials || []) soc[s.type] = s.url;
+        links = { site: links.site || info.websites?.[0]?.url || '', x: links.x || soc.twitter || '', github: links.github || soc.github || '', src: links.src ? links.src + '+Dex' : 'Dex' };
+      }
+    } catch {}
+  }
+  if ((links.site || links.x || links.github) && JSON.stringify(links) !== JSON.stringify(P.links || {})) { P.links = links; save(); }
+  linkCache.set(c, { links, at: now() });
+  return links;
+}
+async function fetchSiteText(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' }, redirect: 'follow' });
+    if (!r.ok) return null;
+    const html = (await r.text()).slice(0, 400000);
+    const text = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return { text: text.slice(0, 6000), html: html.toLowerCase() };
+  } catch { return null; }
+}
+async function aiNarrative(P, links, siteText) {
+  const prompt = `给一个区块链项目做叙事评分。只能依据下面官网文本里的证据打分，文本没提到的维度给低分并注明未提及，不许编造。五维：新颖度0-30（新概念还是旧题材换包装）、应用价值0-25（能否说清解决什么问题）、可信度0-20（有无真实产品/文档/路线图等可验证资料）、社区真实性0-15（只有官网文本时按呈现保守给分）、传播潜力0-10（是否容易被理解和讨论）。另给1-3个概念标签（中文短词，如"Agent协作经济"）、一句话说清项目讲什么、每个维度一句证据。只输出JSON，不要其他文字：{"novelty":0,"value":0,"cred":0,"community":0,"spread":0,"tags":[],"story":"","evidence":[]}\n项目名：${P.name || ''}\n官网：${links.site}\nX：${links.x || '未找到'}（官网互链确认：${links.xVerified ? '是' : '否'}）\nGitHub：${links.github || '未找到'}\n官网文本：${siteText}`;
+  const NC = NARR();
+  const r = await fetch(`${NC.baseUrl || 'https://api.siliconflow.cn/v1'}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${NC.apiKey}` }, body: JSON.stringify({ model: NC.model, messages: [{ role: 'user', content: prompt }], temperature: 0.2, max_tokens: 700 }), signal: AbortSignal.timeout(60000) });
+  const j = await r.json().catch(() => null);
+  const m = (j?.choices?.[0]?.message?.content || '').match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  const o = JSON.parse(m[0]);
+  const cl = (v, mx) => Math.max(0, Math.min(mx, Math.round(Number(v) || 0)));
+  const parts = { novelty: cl(o.novelty, 30), value: cl(o.value, 25), cred: cl(o.cred, 20), community: cl(o.community, 15), spread: cl(o.spread, 10) };
+  const total = parts.novelty + parts.value + parts.cred + parts.community + parts.spread;
+  return { total, grade: narrGradeOf(total), parts, tags: (o.tags || []).slice(0, 3).map(String), story: String(o.story || '').slice(0, 200), evidence: (o.evidence || []).slice(0, 5).map(String), at: now() };
+}
+async function narrativeAlert(c, P, links) {
+  const n = P.narr;
+  if (!n) return;
+  let kind = '', stageTo = 0;
+  if (n.grade === 'A' && (P.narrStage || 0) < 2) { kind = '叙事A级·重点提醒'; stageTo = 2; }
+  else if (n.grade === 'B' && (P.narrStage || 0) < 1) { kind = '叙事B级·观察'; stageTo = 1; }
+  else if ((P.narrStage || 0) >= 2 && (P.narrStage || 0) < 3 && n.total >= (P.narrAlertScore || 0) + 10) { kind = '叙事进展'; stageTo = 3; }
+  if (!kind) return;
+  if ((P.narrTries || 0) >= 5 || now() < (P.narrTryAt || 0)) return;
+  const star = kind.includes('A级') || kind === '叙事进展' ? '🌐⭐' : '🌐';
+  const delivered = await tg(`${star} ${kind}：${P.name || ''}（叙事评分 ${n.total}/100，${n.grade} 级）\n${c}\n项目讲什么：${n.story || '官网未说清'}\n五维：新颖 ${n.parts.novelty}/30｜价值 ${n.parts.value}/25｜可信 ${n.parts.cred}/20｜社区 ${n.parts.community}/15｜传播 ${n.parts.spread}/10\n证据：${n.evidence.join('；')}\n概念：${n.tags.join('、') || '—'}\n官网：${links.site}${links.x ? '\nX：' + links.x + (links.xVerified ? '（官网互链已确认）' : '（归属未确认）') : ''}${links.github ? '\nGitHub：' + links.github : ''}\n注：叙事分只代表故事与证据，不代表合约安全或投资价值，铸造仍走原审核`);
+  P.narrTries = (P.narrTries || 0) + 1;
+  if (delivered) { P.narrStage = stageTo; P.narrAlertScore = n.total; P.narrTries = 0; P.narrTryAt = 0; }
+  else P.narrTryAt = now() + 1800e3;
+  save();
+}
+async function narrativeEval(c, P) {
+  if (!NARR()) return;
+  if (P.narrAt && now() - P.narrAt < 6 * 3600e3) return;
+  const links = await discoverLinks(c, P).catch(() => null);
+  if (!links?.site) { P.narrState = '待验证（未找到官网）'; P.narrAt = now(); save(); return; }
+  const got = await fetchSiteText(links.site);
+  if (!got?.text || got.text.length < 80) { P.narrState = '待验证（官网抓不到正文）'; P.narrAt = now(); save(); return; }
+  links.xVerified = !!(links.x && got.html.includes(xHandle(links.x)));
+  const res = await aiNarrative(P, links, got.text).catch(() => null);
+  if (!res) return; // AI 失败不落状态，下轮重试
+  P.narr = res; P.narrState = ''; P.narrAt = now(); save();
+  await narrativeAlert(c, P, links);
+}
+function tagCounts(track, sinceMs) {
+  const out = {};
+  for (const P of Object.values(track || {})) {
+    if (!P.narr || now() - (P.narr.at || 0) > sinceMs) continue;
+    for (const t of P.narr.tags || []) { out[t] = out[t] || { n: 0, proven: 0 }; out[t].n++; if (P.innoGrade === 'A' || P.innoGrade === 'B') out[t].proven++; }
+  }
+  return out;
+}
+async function narrativeSweep() {
+  if (!NARR()) return;
+  let done = 0;
+  for (const [c, P] of Object.entries(S.track)) {
+    if (done >= 3) break; // 每轮最多评 3 个，控成本与抓取礼貌
+    try {
+      if (now() - (P.at || 0) > 3 * 86400e3) continue;
+      if (P.narrAt && now() - P.narrAt < 6 * 3600e3) continue;
+      await narrativeEval(c, P);
+      done++;
+    } catch {}
+  }
+  // 叙事方向聚类：24h 内同概念 ≥3 个项目且未报过
+  S.narrClusters = S.narrClusters || {};
+  const counts = tagCounts(S.track, 86400e3);
+  for (const [tag, v] of Object.entries(counts)) {
+    if (v.n >= 3 && now() - (S.narrClusters[tag] || 0) > 86400e3) {
+      S.narrClusters[tag] = now(); save();
+      await tg(`🌐 新叙事方向：「${tag}」\n过去 24 小时发现 ${v.n} 个项目在讲这个概念，其中 ${v.proven} 个有独立技术实现证据（技术创新 B 级以上）。发「叙事」看各项目评分`);
+    }
+  }
+}
+
 const median = (a) => { const s = [...a].sort((p, q) => p - q); return s[Math.floor(s.length / 2)]; };
 const tpFrac = (x, cost) => (cost > 0 ? Math.min(1, (1 + OUR.tpProfit) / x) : 0.5);
 
@@ -1030,6 +1161,14 @@ async function handleTgCmd(text) {
     if (!list.length) { await tg('近 7 天还没有圈出的创新项目'); return; }
     const lines = list.map(([c, P]) => `⭐ ${P.name || c.slice(0, 10)}｜${P.innoGrade || ''} 级 ${P.innovative}/90｜裁决：${P.verdict?.s || '未定'}${P.verdict?.why ? '（' + P.verdict.why + '）' : ''}\n${c}`);
     await tg('圈出的创新项目：\n' + lines.join('\n'));
+    return;
+  }
+  if (text === '叙事') {
+    const list = Object.entries(S.track).filter(([, P]) => P.narr && now() - (P.at || 0) < 7 * 86400e3).sort((a, b) => (b[1].narr.total || 0) - (a[1].narr.total || 0));
+    const pending = Object.values(S.track).filter((P) => P.narrState && now() - (P.at || 0) < 3 * 86400e3).length;
+    if (!list.length) { await tg('近 7 天还没有叙事评分' + (pending ? `（${pending} 个项目待验证）` : '')); return; }
+    const lines = list.slice(0, 15).map(([c, P]) => `🌐 ${P.name || c.slice(0, 10)}｜叙事 ${P.narr.total}/100 ${P.narr.grade} 级｜概念：${(P.narr.tags || []).join('、') || '—'}｜技术 ${P.innoGrade || '—'} 级\n${P.links?.site || c}`);
+    await tg('叙事评分（近 7 天）：\n' + lines.join('\n') + (pending ? `\n另有 ${pending} 个项目待验证（无官网/抓不到）` : ''));
     return;
   }
   if (text === '项目') {
@@ -1193,6 +1332,16 @@ function runSelfTest() {
   eq(rn.firstSels.length, 1, 'compareHist new first-seen sel');
   eq(rn.firstFams[0], '任务', 'compareHist new first-seen fam');
   eq(Math.round(rn.sim * 100), 0, 'compareHist disjoint sim 0');
+  const lu = extractUrls('site https://foo-protocol.xyz/ and x https://x.com/foo_protocol gh https://github.com/foo/bar end');
+  eq(lu.site, 'https://foo-protocol.xyz/', 'extractUrls site');
+  eq(lu.x, 'https://x.com/foo_protocol', 'extractUrls x');
+  eq(lu.github, 'https://github.com/foo/bar', 'extractUrls github');
+  eq(narrGradeOf(70), 'A', 'narrGradeOf 70 = A');
+  eq(narrGradeOf(45), 'B', 'narrGradeOf 45 = B');
+  eq(narrGradeOf(44), 'C', 'narrGradeOf 44 = C');
+  const tc = tagCounts({ a: { narr: { at: now(), tags: ['Agent协作'] }, innoGrade: 'B' }, b: { narr: { at: now(), tags: ['Agent协作'] } } }, 86400e3);
+  eq(tc['Agent协作'].n, 2, 'tagCounts n=2');
+  eq(tc['Agent协作'].proven, 1, 'tagCounts proven=1');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
@@ -1203,10 +1352,12 @@ else {
   setInterval(() => { gapRetry().catch(() => {}); }, 30000);
   setInterval(() => { paidSweep().catch(() => {}); }, 60000);
   setInterval(() => { innoSweep().catch(() => {}); }, 60000);
+  setInterval(() => { narrativeSweep().catch(() => {}); }, 300000);
   setInterval(() => { fastLane().catch(() => {}); }, 15000);
   setInterval(() => { holdWatch().catch(() => {}); }, 60000);
   setInterval(() => { tgPoll().catch(() => {}); }, 3000);
   setInterval(() => { loginCheck().catch(() => {}); }, 1800e3);
   setTimeout(() => { paidSweep().catch(() => {}); }, 8000);
   setTimeout(() => { innoSweep().catch(() => {}); }, 20000);
+  setTimeout(() => { narrativeSweep().catch(() => {}); }, 60000);
 }
