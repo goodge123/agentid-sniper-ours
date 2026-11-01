@@ -418,7 +418,7 @@ async function scanBlocks(from, to) {
             // 参与计数（去重钱包）
             const P = S.track[to];
             P.agentSet = P.agentSet || {};
-            if (!P.agentSet[fromA]) { P.agentSet[fromA] = 1; P.agents = Object.keys(P.agentSet).length; save(); }
+            if (!P.agentSet[fromA]) { P.agentSet[fromA] = 1; P.agents = Object.keys(P.agentSet).length; P.agentBlocks = P.agentBlocks || {}; P.agentBlocks[b] = (P.agentBlocks[b] || 0) + 1; save(); }
           });
         }
       } catch {}
@@ -488,15 +488,120 @@ async function riskNote(c) {
   } catch { return ''; }
 }
 
+// ---------- 创新性判断：≥2 项命中 = 创新候选，⭐ 重点提醒并单独圈出 ----------
+const KECCAK_RC = [0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n, 0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n, 0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an, 0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n, 0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an, 0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n];
+const KECCAK_ROTC = [1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44];
+const KECCAK_PILN = [10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1];
+const M64 = (1n << 64n) - 1n;
+const rotl64 = (x, n) => (n === 0 ? x : ((x << BigInt(n)) | (x >> BigInt(64 - n))) & M64);
+function keccakF(st) {
+  for (let round = 0; round < 24; round++) {
+    const bc = [];
+    for (let i = 0; i < 5; i++) bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+    for (let i = 0; i < 5; i++) {
+      const t = bc[(i + 4) % 5] ^ rotl64(bc[(i + 1) % 5], 1);
+      for (let j = 0; j < 25; j += 5) st[j + i] ^= t;
+    }
+    let t = st[1];
+    for (let i = 0; i < 24; i++) {
+      const j = KECCAK_PILN[i];
+      const tmp = st[j];
+      st[j] = rotl64(t, KECCAK_ROTC[i]);
+      t = tmp;
+    }
+    for (let j = 0; j < 25; j += 5) {
+      const row = st.slice(j, j + 5);
+      for (let i = 0; i < 5; i++) st[j + i] = row[i] ^ ((~row[(i + 1) % 5]) & row[(i + 2) % 5]);
+    }
+    st[0] ^= KECCAK_RC[round];
+  }
+}
+function keccak256(bytes) {
+  const rate = 136;
+  const st = new Array(25).fill(0n);
+  const padLen = rate - (bytes.length % rate);
+  const padded = Buffer.alloc(bytes.length + padLen);
+  Buffer.from(bytes).copy(padded);
+  padded[bytes.length] |= 0x01;
+  padded[padded.length - 1] |= 0x80;
+  for (let off = 0; off < padded.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) {
+      let lane = 0n;
+      for (let b = 7; b >= 0; b--) lane = (lane << 8n) | BigInt(padded[off + i * 8 + b]);
+      st[i] ^= lane;
+    }
+    keccakF(st);
+  }
+  const out = Buffer.alloc(32);
+  for (let i = 0; i < 4; i++) {
+    let lane = st[i];
+    for (let b = 0; b < 8; b++) { out[i * 8 + b] = Number(lane & 0xffn); lane >>= 8n; }
+  }
+  return out.toString('hex');
+}
+const sigSel = (sig) => keccak256(Buffer.from(sig, 'utf8')).slice(0, 8);
+const KNOWN_SEL = new Set(['1249c58b', '5b70ea9f', '4e71d92d', 'a0712d68', '26092b83', '74d04cfc', '9f92d0dd', '7c928fe9', '379607f5', '8ab53447', 'f366afc9', '1be3587a', '70a08231', 'a9059cbb', '095ea7b3', '23b872dd', 'dd62ed3e', '18160ddd', '06fdde03', '95d89b41', '313ce567', '8da5cb5b', '715018a6', 'f2fde38b', '40c10f19', '8456cb59', '3f4ba83a', '6352211e', '081812fc', 'b88d4fde', 'a22cb465', 'e985e9c5', '01ffc9a7', '80ac58cd', '68bce8cd', '725c4058', '590e1ae3', 'b5545a3c', '278ecde1', '5b7baf64', '110f8874', '16bfe25c', '38e771ab', 'b2d5ae44', 'fa89401a', 'bffa55d5', '68ec0d99', '74c1b1c9', 'b30196e5', 'c033a490', '4c4a386f', 'd233e4eb']);
+const innoCache = new Map();
+async function innovation(c, P) {
+  if (innoCache.has(c)) return innoCache.get(c);
+  let score = 0;
+  const hits = [];
+  try {
+    const src = await sourcifySrc(await logicAddr(c));
+    if (src) {
+      if (src.length > 15000) { score++; hits.push('源码已验证且规模大（非模板小合约）'); }
+      const sels = new Set();
+      for (const m of src.matchAll(/function\s+(\w+)\s*\(([^)]*)\)/g)) {
+        const types = m[2].split(',').map((p) => p.trim().split(/\s+/)[0]).filter(Boolean).join(',');
+        if (types.includes('(')) continue;
+        try { sels.add(sigSel(`${m[1]}(${types})`)); } catch {}
+      }
+      const novel = [...sels].filter((s) => !KNOWN_SEL.has(s));
+      if (novel.length >= 3) { score++; hits.push(`有 ${novel.length} 个非常规函数（自有机制）`); }
+    }
+    const learnedSels = new Set((S.learned?.[c] || []).map((d) => d.slice(0, 10).toLowerCase()));
+    if (learnedSels.size >= 2) { score++; hits.push('Agent ID 钱包有多种交互方式（不止铸造）'); }
+    if (await hasRefund(c)) { score++; hits.push('带退款保本机制'); }
+  } catch {}
+  const res = { score, hits };
+  innoCache.set(c, res);
+  if (P && score >= 2) { P.innovative = score; save(); }
+  return res;
+}
+async function innoAlert(c, P) {
+  const inno = await innovation(c, P).catch(() => ({ score: 0, hits: [] }));
+  if (inno.score >= 2 && !P.innoNoted) {
+    P.innoNoted = 1; save();
+    await tg(`⭐ 重点提醒·创新候选：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\nTG 发「创新」可看全部圈出的创新项目`);
+  }
+  return inno;
+}
+
 // ---------- 免费执行：时机门槛 -> 审核门 -> gas -> baw 预览 -> 执行 ----------
 const mintQueues = new Map();
 const mintQueued = new Set();
 const mintClosed = (P, W) => { const d = P?.done?.[W.name]; return (d && d !== 'free') || (P?.count?.[W.name] || 0) >= 10; };
+function setVerdict(P, s, why) {
+  // 每项目一条裁决记录：通过 / 观察 / 拒绝 + 原因（TG 发「项目」可查）
+  if (P.verdict?.s === s && P.verdict?.why === why) return;
+  const changed = P.verdict?.s !== s;
+  P.verdict = { s, why, at: now() };
+  save();
+  if (changed) log(`裁决 ${P.name || ''}：${s}——${why}`);
+}
+function effAgents(P) {
+  // 有效参与数：同一区块涌入的参与钱包每块最多算 3 个（批量脚本同块进场打折）
+  if (!P.agentBlocks) return P.agents || 0;
+  let eff = 0;
+  for (const n of Object.values(P.agentBlocks)) eff += Math.min(n, 3);
+  return eff;
+}
 function noteFail(P, W, why) {
   // 临时失败：记次数，2 分钟后重试；连续 3 次才放弃（记 fail）
   P.failCnt = P.failCnt || {};
   P.failCnt[W.name] = (P.failCnt[W.name] || 0) + 1;
-  if (P.failCnt[W.name] >= 3) { P.done[W.name] = 'fail'; save(); return '❌ 连续失败 3 次，放弃：' + why; }
+  if (P.failCnt[W.name] >= 3) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '连续失败 3 次：' + why); save(); return '❌ 连续失败 3 次，放弃：' + why; }
+  setVerdict(P, '观察', '临时失败，自动重试中：' + why);
   P.retryAt = P.retryAt || {};
   P.retryAt[W.name] = now() + 120e3;
   save();
@@ -541,21 +646,32 @@ async function autoMint(c, found, W) {
   const P = S.track[c] || (S.track[c] = { at: now(), name: '', done: {}, agents: 0 });
   if (P.done[W.name] && P.done[W.name] !== 'free') return '✅ 这个钱包已经打过';
   if ((P.count?.[W.name] || 0) >= 10) return '✅ 这个钱包已打满 10 份';
+  // 部署者筛选：黑名单直接拦（黑名单由审核硬红旗自动入册，见审核门）
+  const dep = P.deployer || '';
+  if (dep && S.black[dep]) {
+    if (P.verdict?.s !== '拒绝') await tg(`⛔ 部署者在黑名单，免费未打：${P.name || ''}\n${c}\n部署者 ${dep}\n入册原因：${S.black[dep].why}`);
+    setVerdict(P, '拒绝', '部署者黑名单：' + S.black[dep].why);
+    return '⛔ 部署者在黑名单，没有打';
+  }
+  const serialN = dep ? (S.devProjects?.[dep] || []).length : 0;
   // 时机门槛
   const fp = await readProgress(c);
-  if (fp != null && fp < OUR.goPct) { P.waitHot = 1; save(); return `⏸ 进度 ${Math.floor(fp * 100)}%，未到 ${Math.round(OUR.goPct * 100)}%，先追踪`; }
+  if (fp != null && fp < OUR.goPct) { P.waitHot = 1; setVerdict(P, '观察', `进度 ${Math.floor(fp * 100)}%，未到 ${Math.round(OUR.goPct * 100)}%`); save(); return `⏸ 进度 ${Math.floor(fp * 100)}%，未到 ${Math.round(OUR.goPct * 100)}%，先追踪`; }
   if (fp == null) {
-    if ((P.agents || 0) < OUR.crowdGo) { P.waitHot = 1; save(); return `⏸ 读不到进度，目前 ${P.agents || 0} 个 Agent ID 钱包在打，要 ${OUR.crowdGo} 个才打`; }
+    const eff = effAgents(P);
+    if (eff < OUR.crowdGo) { P.waitHot = 1; setVerdict(P, '观察', `读不到进度，Agent ID 钱包 ${P.agents || 0} 个、同块打折后有效 ${eff} 个，未到 ${OUR.crowdGo}`); save(); return `⏸ 读不到进度，目前 ${P.agents || 0} 个 Agent ID 钱包在打（有效 ${eff}），要 ${OUR.crowdGo} 个才打`; }
     const tk = await tokenOf(c).catch(() => c);
-    if (await poolOpen(tk)) return '⏸ 已开池，不铸（铸价通常贵过市价）';
+    if (await poolOpen(tk)) { setVerdict(P, '观察', '已开池，不铸造'); return '⏸ 已开池，不铸（铸价通常贵过市价）'; }
   }
   // 合约审核门
   let note = '';
   if (OUR.audit) {
     const au = await auditContract(c);
     if (au.verdict === 'flag') {
+      if (dep && !S.black[dep]) { S.black[dep] = { why: `合约审核硬红旗（${P.name || c.slice(0, 10)}）：${au.hard.join('、')}`, at: now() }; save(); }
+      setVerdict(P, '拒绝', '合约审核硬红旗：' + au.hard.join('、'));
       S.auditNoted = S.auditNoted || {};
-      if (!S.auditNoted[c]) { S.auditNoted[c] = 1; save(); await tg(`🛡 合约审核拦截（免费未打）：${P.name || ''}\n${c}\n红旗：${au.hard.join('、')}${au.impl ? `\n代理实现合约：${au.impl}` : ''}\n源码已验证但有以上风险，按 A 档规矩没有打；你说打才打\nhttps://bscscan.com/address/${c}`); }
+      if (!S.auditNoted[c]) { S.auditNoted[c] = 1; save(); await tg(`🛡 合约审核拦截（免费未打）：${P.name || ''}\n${c}\n红旗：${au.hard.join('、')}${au.impl ? `\n代理实现合约：${au.impl}` : ''}\n源码已验证但有以上风险，按 A 档规矩没有打；你说打才打${dep ? '\n该部署者已记入黑名单，后续项目自动拦' : ''}\nhttps://bscscan.com/address/${c}`); }
       return `🛡 合约审核拦截：${au.hard.join('、')}`;
     }
     if (au.verdict === 'soft') note = '\n（源码已验证，审核提示：' + au.soft.join('、') + '）';
@@ -567,10 +683,14 @@ async function autoMint(c, found, W) {
         S.auditNoted = S.auditNoted || {};
         const gk = c + '|gas';
         if (!S.auditNoted[gk]) { S.auditNoted[gk] = 1; save(); await tg(`🛡 gas 估算异常拦截（免费未打）：${P.name || ''}\n${c}\n估算约 ${Number(BigInt(ge)).toLocaleString('en-US')}，超过拦截线 ${OUR.gasCap.toLocaleString('en-US')}\nhttps://bscscan.com/address/${c}`); }
+        setVerdict(P, '拒绝', `gas 估算异常（约 ${Number(BigInt(ge)).toLocaleString('en-US')}）`);
         return `🛡 gas 估算异常（约 ${Number(BigInt(ge)).toLocaleString('en-US')}）`;
       }
     } catch {}
   }
+  if (serialN >= 3) note += `\n（部署者已发 ${serialN} 个项目）`;
+  const inno = await innoAlert(c, P);
+  if (inno.score >= 2) note += '\n（⭐ 创新候选：' + inno.hits.join('、') + '）';
   // 每日上限与 gas 余额
   const tk2 = todayKey();
   S.mintCnt = S.mintCnt || {};
@@ -582,18 +702,19 @@ async function autoMint(c, found, W) {
   const p = await W.baw(['contract-call', 'preview', '--binanceChainId', '56', '--from', W.addr, '--to', c, '--value', '0', '--inputData', found.data]);
   const sim = p.j?.data?.simulationResult, rid = p.j?.data?.requestId;
   if (!p.j?.success || !rid) return noteFail(P, W, '预演请求失败：' + (p.j?.error?.message || '无响应').slice(0, 120));
-  if (sim?.allowanceChanges?.length || sim?.authorityChanges?.length) { P.done[W.name] = 'fail'; save(); return '⚠️ 预演显示有授权变化，没有打'; }
+  if (sim?.allowanceChanges?.length || sim?.authorityChanges?.length) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示有授权变化'); save(); return '⚠️ 预演显示有授权变化，没有打'; }
   const mine = (sim?.balanceChanges || []).filter((b) => LC(b.owner) === W.addr);
   const losing = mine.filter((b) => Number(b.change) < 0);
-  if (losing.length) { P.done[W.name] = 'fail'; save(); return '⚠️ 预演显示会扣你的资产，没有打'; }
+  if (losing.length) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示会扣资产'); save(); return '⚠️ 预演显示会扣你的资产，没有打'; }
   const gaining = mine.some((b) => Number(b.change) > 0 || /Erc721|Erc1155/i.test(b.tokenType || ''));
-  if (!gaining) { P.done[W.name] = 'fail'; save(); return '⚪ 预演显示拿不到东西，没有打'; }
+  if (!gaining) { P.done[W.name] = 'fail'; setVerdict(P, '拒绝', '预演显示拿不到东西'); save(); return '⚪ 预演显示拿不到东西，没有打'; }
   const x = await W.baw(['contract-call', 'execute', '--requestId', rid]);
   if (!x.j && /timed? ?out|ETIMEDOUT|killed/i.test(x.t || '')) { P.done[W.name] = 'unknown'; save(); await tg(`⚠️ 免费铸造送出结果不明（超时），先不重打：${P.name || ''}\n${c}`); return '⚠️ 送出结果不明'; }
   if (!x.j?.success) return noteFail(P, W, '送出失败：' + (x.j?.error?.message || x.t).slice(0, 120));
   P.done[W.name] = 'free';
   P.count = P.count || {};
   P.count[W.name] = (P.count[W.name] || 0) + 1;
+  setVerdict(P, '通过', `免费铸造成功（共 ${P.count[W.name]} 份）`);
   if (P.failCnt) delete P.failCnt[W.name];
   if (P.retryAt) delete P.retryAt[W.name];
   S.mintCnt[W.name] = (S.mintCnt[W.name] || 0) + 1;
@@ -652,6 +773,7 @@ async function analyzePaid(c, P) {
   const tk = await tokenOf(c).catch(() => c);
   const pool = await poolOpen(tk).catch(() => false);
   const agents = P.agents || 0;
+  const eff = effAgents(P);
   let verdict, reason;
   if (black) { verdict = '不打'; reason = `部署者在黑名单（${black}）`; }
   else if (maxShares === 0) { verdict = '不打'; reason = '单价超过付费上限'; }
@@ -661,16 +783,20 @@ async function analyzePaid(c, P) {
   else if (rn) { verdict = '观望'; reason = '合约留有开发者权限，见下方提醒'; }
   else if (pool) { verdict = '观望'; reason = '已经开池，铸造价可能不如市价，要先比价'; }
   else { verdict = '可以打'; reason = '有退款保本、进度过门槛、参与人数够、未见合约风险'; }
+  setVerdict(P, verdict === '可以打' ? '通过' : verdict === '观望' ? '观察' : '拒绝', reason);
+  const inno = await innovation(c, P).catch(() => ({ score: 0, hits: [] }));
   log(`付费分析 ${P.name || c}：${verdict}——${reason}`);
   await tg(`🔔 付费项目分析：${P.name || c.slice(0, 10)}（进度 ${progress != null ? Math.round(progress * 100) + '%' : '读不到'}${sold != null && cap ? `，已售 ${sold}/${cap}` : ''}）
 合约：${c}
 类型：${{ bnb: 'BNB 报价型', usdt: 'USDT 份额型', gen: 'NFT 单价型' }[kind] || kind}
 单价：${unitTxt}${costTxt ? `\n成本：${costTxt}` : ''}
-参与：Agent ID 钱包约 ${agents} 个${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
+参与：Agent ID 钱包约 ${agents} 个${eff !== agents ? `（同块批量打折后有效约 ${eff} 个）` : ''}${dep ? `\n部署者：${dep}${black ? '（黑名单）' : ''}${serial}` : ''}
+创新：${inno.score >= 2 ? '⭐ 有创新点' : '一般'}${inno.hits.length ? '（' + inno.hits.join('、') + '）' : ''}
 保本：合约有退款函数 ✓${pool ? '\n状态：已开池' : ''}${rn}
 合约审核：${au.verdict === 'clean' ? '源码已验证、未见红旗' : au.verdict === 'flag' ? '源码已验证但有红旗：' + au.hard.join('、') : au.verdict === 'soft' ? '源码已验证，审核提示：' + au.soft.join('、') : '源码未验证'}
 结论：${verdict}——${reason}
 要打回主聊天告诉我打哪个、多少份，我先预览报总成本和每份到账，你确认了才执行；不回就不打`);
+  if (inno.score >= 2 && !P.innoNoted) { P.innoNoted = 1; save(); await tg(`⭐ 重点提醒·创新候选：${P.name || ''}\n${c}\n创新点：${inno.hits.join('、')}\n付费结论：${verdict}——${reason}\nTG 发「创新」可看全部圈出的创新项目`); }
 }
 async function paidSweep() {
   for (const [c, P] of Object.entries(S.track)) {
@@ -692,11 +818,11 @@ async function paidSweep() {
       // 收费线
       if (!P.kind) P.kind = await classifyPaid(c).catch(() => 'gen');
       if (P.refundOk == null) { P.refundOk = (await hasRefund(c).catch(() => false)) ? 1 : 0; save(); }
-      const gate = (fp != null && fp >= OUR.goPct) || (fp == null && (P.agents || 0) >= OUR.crowdGo);
+      const gate = (fp != null && fp >= OUR.goPct) || (fp == null && effAgents(P) >= OUR.crowdGo);
       if (!gate) continue;
       if (!P.refundOk) {
         if (!P.noRefundLog) {
-          P.noRefundLog = 1; save();
+          P.noRefundLog = 1; setVerdict(P, '拒绝', '付费项目无退款（保本）机制'); save();
           await tg(`🔔 付费项目分析：${P.name || c.slice(0, 10)}（进度 ${fp != null ? Math.round(fp * 100) + '%' : '读不到'}）\n合约：${c}\n结论：不打——付费项目但合约没有退款（保本）机制\n要破例打，回主聊天告诉我，我先预览报数你再确认`);
         }
         continue;
@@ -817,6 +943,21 @@ async function handleTgCmd(text) {
       lines.push(`${t.sym} ${t.addr}${d?.px ? ` 现价 $${d.px}` : ''}`);
     }
     await tg(lines.length ? lines.join('\n') : '追踪中的持仓都已清零');
+    return;
+  }
+  if (text === '创新') {
+    const list = Object.entries(S.track).filter(([, P]) => P.innovative && now() - (P.at || 0) < 7 * 86400e3);
+    if (!list.length) { await tg('近 7 天还没有圈出的创新项目'); return; }
+    const lines = list.map(([c, P]) => `⭐ ${P.name || c.slice(0, 10)}｜裁决：${P.verdict?.s || '未定'}${P.verdict?.why ? '（' + P.verdict.why + '）' : ''}\n${c}`);
+    await tg('圈出的创新项目：\n' + lines.join('\n'));
+    return;
+  }
+  if (text === '项目') {
+    const list = Object.entries(S.track).filter(([, P]) => now() - (P.at || 0) < 3 * 86400e3);
+    if (!list.length) { await tg('近 3 天没有追踪中的项目'); return; }
+    list.sort((a, b) => (b[1].innovative || 0) - (a[1].innovative || 0) || (b[1].at || 0) - (a[1].at || 0));
+    const lines = list.slice(0, 15).map(([c, P]) => `${P.innovative ? '⭐ ' : ''}${P.verdict?.s || '未定'}｜${P.name || c.slice(0, 10)}｜${P.verdict?.why || '还没出裁决'}\n${c}`);
+    await tg('近 3 天项目裁决（⭐ = 创新候选）：\n' + lines.join('\n'));
     return;
   }
   const sellM = text.match(/^卖\s+(\S+)(?:\s+(一半|全部))?$/);
@@ -948,6 +1089,13 @@ function runSelfTest() {
   eq(mintClosed({ done: { w: 'free' }, count: { w: 3 } }, { name: 'w' }), false, 'mintClosed free+3 open');
   eq(mintClosed({ done: { w: 'free' }, count: { w: 10 } }, { name: 'w' }), true, 'mintClosed 10 closed');
   eq(mintClosed({ done: { w: 'fail' }, count: { w: 1 } }, { name: 'w' }), true, 'mintClosed fail closed');
+  eq(effAgents({ agents: 100, agentBlocks: { 100: 60, 101: 40 } }), 6, 'effAgents bunched discount');
+  eq(effAgents({ agents: 6, agentBlocks: { 1: 2, 2: 2, 3: 2 } }), 6, 'effAgents spread full');
+  eq(effAgents({ agents: 42 }), 42, 'effAgents no-blocks fallback');
+  eq(keccak256(Buffer.alloc(0)), 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470', 'keccak256 empty');
+  eq(sigSel('transfer(address,uint256)'), 'a9059cbb', 'sigSel transfer');
+  eq(sigSel('balanceOf(address)'), '70a08231', 'sigSel balanceOf');
+  ok(KNOWN_SEL.has(sigSel('mint()')), 'mint() is a known selector');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
