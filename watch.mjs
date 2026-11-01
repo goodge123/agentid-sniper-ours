@@ -22,6 +22,11 @@ try {
     if (kv.AI_API_KEY) CONFIG.narrative = { apiKey: kv.AI_API_KEY, baseUrl: kv.AI_BASE_URL || 'https://api.siliconflow.cn/v1', model: kv.AI_MODEL || 'Qwen/Qwen2.5-7B-Instruct' };
   }
 } catch {}
+// 专属 RPC 可单独放 rpcs.env（一行一个地址）：只存服务器、不进 git，部署覆盖 config.json 时不丢
+let PAID_RPCS = Array.isArray(CONFIG.rpcs) ? CONFIG.rpcs.filter(Boolean) : [];
+try {
+  if (!PAID_RPCS.length && existsSync(join(DIR, 'rpcs.env'))) PAID_RPCS = readFileSync(join(DIR, 'rpcs.env'), 'utf8').split('\n').map((s) => s.trim()).filter((s) => s.startsWith('http'));
+} catch {}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 const LC = (a) => String(a || '').toLowerCase();
@@ -94,19 +99,38 @@ if (!SELFTEST) try {
   writeFileSync(LOCK_FILE, String(process.pid));
 } catch {}
 
-// ---------- RPC：多节点轮替，第一个成功答复为准；坏节点短暂冷却 ----------
-const RPCS = Array.isArray(CONFIG.rpcs) && CONFIG.rpcs.length ? CONFIG.rpcs : [
+// ---------- RPC：专属节点优先（按估算 CU 用量，单 key 到 90% 自动切换下一个），全用完/全失败回落公共节点；坏节点短暂冷却 ----------
+const PUBLIC_RPCS = [
   'https://bsc-dataseed.bnbchain.org',
   'https://bsc-rpc.publicnode.com',
   'https://bsc.publicnode.com',
   'https://bsc.drpc.org',
 ];
-let ri = 0;
+const CU_CAP = 9_000_000; // 每 key 总额度 1000 万 CU，估算用量到 90% 即切换（用户 16:12 口径）
+const CU_W = { eth_blockNumber: 5, eth_getBlockByNumber: 20, eth_call: 26, eth_getCode: 15, eth_getBalance: 15, eth_estimateGas: 26, eth_getLogs: 75, eth_getTransactionReceipt: 15, eth_getTransactionByHash: 15 };
+const cuWeight = (m) => CU_W[m] || 20; // NodeReal CU 单价为估算口径，够用于切换决策
+const RPC_USAGE_FILE = join(DIR, 'rpc-usage.json'); // 放在程序目录（非 data/），部署清 state 时不重置
+let rpcUse = {};
+try { rpcUse = JSON.parse(readFileSync(RPC_USAGE_FILE, 'utf8')); } catch {}
+let rpcCallsSinceSave = 0;
+function saveRpcUse() { try { writeFileSync(RPC_USAGE_FILE, JSON.stringify(rpcUse)); } catch {} }
+const rpcExhausted = (u) => (rpcUse[u] || 0) >= CU_CAP;
+const rpcPool = () => { const act = PAID_RPCS.filter((u) => !rpcExhausted(u)); return act.length ? act : PUBLIC_RPCS; };
+function addRpcUse(u, method) {
+  if (!PAID_RPCS.includes(u)) return;
+  const before = rpcUse[u] || 0;
+  rpcUse[u] = before + cuWeight(method);
+  if (before < CU_CAP && rpcUse[u] >= CU_CAP) { saveRpcUse(); log(`专属 RPC 第 ${PAID_RPCS.indexOf(u) + 1} 个 key 估算用量已达 90%（约 ${Math.round(rpcUse[u] / 10000)} 万 CU），自动切换下一个`); }
+  else if (++rpcCallsSinceSave >= 100) { rpcCallsSinceSave = 0; saveRpcUse(); }
+}
+if (PAID_RPCS.length) log(`RPC：专属节点 ${PAID_RPCS.length} 个（单 key 估算到 90% 自动切换，全用完回落公共节点）`);
+let riUrl = '';
 const rpcBad = new Map();
 const rpcFailN = new Map();
-async function rpc(method, params) {
+async function tryPool(pool, method, params) {
   let last = null;
-  const order = RPCS.map((_, i) => RPCS[(ri + i) % RPCS.length]);
+  const start = Math.max(0, pool.indexOf(riUrl));
+  const order = pool.map((_, i) => pool[(start + i) % pool.length]);
   const avail = order.filter((u) => (rpcBad.get(u) || 0) <= now());
   // 全在冷却时也至少试最早解禁的一个，绝不整批放弃（否则一波限流就永久假死）
   const tryList = avail.length ? avail : [order.reduce((a, b) => ((rpcBad.get(a) || 0) <= (rpcBad.get(b) || 0) ? a : b))];
@@ -116,7 +140,8 @@ async function rpc(method, params) {
       const j = await res.json();
       if (j.error) throw new Error(j.error.message || 'rpc error');
       rpcBad.delete(u); rpcFailN.delete(u);
-      ri = RPCS.indexOf(u);
+      riUrl = u;
+      addRpcUse(u, method);
       return j.result;
     } catch (e) {
       last = e;
@@ -125,6 +150,11 @@ async function rpc(method, params) {
     }
   }
   throw last || new Error('all rpc down');
+}
+async function rpc(method, params) {
+  const pool = rpcPool();
+  try { return await tryPool(pool, method, params); }
+  catch (e) { if (pool !== PUBLIC_RPCS) return await tryPool(PUBLIC_RPCS, method, params); throw e; }
 }
 const call = (to, data) => rpc('eth_call', [{ to, data }, 'latest']).catch(() => null);
 const big = (h) => (h && h !== '0x' && h.length >= 66 ? BigInt(h.slice(0, 66)) : 0n);
@@ -1480,6 +1510,10 @@ function runSelfTest() {
   eq(lu3.x, '', 'extractUrls x status link rejected');
   ok(deadLink(404) && deadLink(410) && !deadLink(200) && !deadLink(0) && !deadLink(403), 'deadLink only 404/410');
   ok(!hasPublicLinks({ site: '', x: '', github: '' }) && hasPublicLinks({ site: 'https://a.fun' }) && hasPublicLinks({ x: 'https://x.com/a' }) && hasPublicLinks({ github: 'https://github.com/a/b' }), 'hasPublicLinks any one is enough');
+  eq(cuWeight('eth_call'), 26, 'cuWeight eth_call');
+  eq(cuWeight('eth_getLogs'), 75, 'cuWeight eth_getLogs');
+  eq(cuWeight('eth_somethingElse'), 20, 'cuWeight default');
+  ok(CU_CAP === 9_000_000 && !rpcExhausted('https://example.invalid/nope'), 'rpc CU cap 90% of 10M');
   console.log(process.exitCode ? 'SELFTEST FAILED' : 'SELFTEST ALL OK');
 }
 if (SELFTEST) runSelfTest();
