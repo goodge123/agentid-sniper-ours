@@ -100,19 +100,15 @@ if (!SELFTEST) try {
 } catch {}
 
 // ---------- RPC：公共节点优先，限流/全失败时切专属节点顶上，公共恢复自动切回（用户 16:20 口径）；专属按估算 CU 用量，单 key 到 90% 自动换下一个；坏节点短暂冷却 ----------
+// 注：币安 dataseed 全系（含 bnbchain.org 与 defibit 镜像）被其 CDN 按 IP 封 403（2026-11-02 在扫描机实测，换 UA 无效），勿加回；以下均为扫描机实测可达
 const PUBLIC_RPCS = [
-  'https://bsc-dataseed.bnbchain.org',
   'https://bsc-rpc.publicnode.com',
   'https://bsc.publicnode.com',
-  'https://bsc.drpc.org',
-  'https://bsc-dataseed.binance.org',
-  'https://bsc-dataseed1.binance.org',
-  'https://bsc-dataseed2.binance.org',
-  'https://bsc-dataseed3.binance.org',
-  'https://bsc-dataseed4.binance.org',
-  'https://bsc-dataseed1.defibit.io',
-  'https://bsc-dataseed2.defibit.io',
   'https://bsc-mainnet.public.blastapi.io',
+  'https://bsc.meowrpc.com',
+  'https://rpc-bsc.48.club',
+  'https://bsc.rpc.blxrbdn.com',
+  'https://bsc.drpc.org',
 ];
 const CU_CAP = 9_000_000; // 每 key 总额度 1000 万 CU，估算用量到 90% 即切换（用户 16:12 口径）
 const CU_W = { eth_blockNumber: 5, eth_getBlockByNumber: 20, eth_call: 26, eth_getCode: 15, eth_getBalance: 15, eth_estimateGas: 26, eth_getLogs: 75, eth_getTransactionReceipt: 15, eth_getTransactionByHash: 15 };
