@@ -105,6 +105,14 @@ const PUBLIC_RPCS = [
   'https://bsc-rpc.publicnode.com',
   'https://bsc.publicnode.com',
   'https://bsc.drpc.org',
+  'https://bsc-dataseed.binance.org',
+  'https://bsc-dataseed1.binance.org',
+  'https://bsc-dataseed2.binance.org',
+  'https://bsc-dataseed3.binance.org',
+  'https://bsc-dataseed4.binance.org',
+  'https://bsc-dataseed1.defibit.io',
+  'https://bsc-dataseed2.defibit.io',
+  'https://bsc-mainnet.public.blastapi.io',
 ];
 const CU_CAP = 9_000_000; // 每 key 总额度 1000 万 CU，估算用量到 90% 即切换（用户 16:12 口径）
 const CU_W = { eth_blockNumber: 5, eth_getBlockByNumber: 20, eth_call: 26, eth_getCode: 15, eth_getBalance: 15, eth_estimateGas: 26, eth_getLogs: 75, eth_getTransactionReceipt: 15, eth_getTransactionByHash: 15 };
